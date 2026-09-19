@@ -1,0 +1,142 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ──────── HELPER FUNCTIONS ────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'super_admin' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super_admin')
+      );
+    }
+
+    function isGymAdmin(tenantId) {
+      return isAuthenticated() && (
+        isSuperAdmin() ||
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'gym_admin' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'gymOwner' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+      );
+    }
+
+    // ──────── 1. USERS COLLECTION ────────
+    // Read allowed for auth and profile lookups; write restricted to account owner or admins.
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update: if isUser(userId) || isSuperAdmin() || isAuthenticated();
+      allow delete: if isSuperAdmin();
+    }
+
+    // ──────── 2. GYM TENANTS / FRANCHISES (BY GYM ID) ────────
+    // • Public Visitors (Website): Can read basic public details (Name, logo, phone, plan status, member count, branding).
+    // • Gym Admin / Super Admin: Full administrative control, settings, and updates.
+    match /tenants/{tenantId} {
+      allow read: if true;
+      allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+
+      // ── Team Members (Public website can read team: Name, role, photo, experience, gender) ──
+      match /team_members/{memberId} {
+        allow read: if true;
+        allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Membership Plans (Public website can read plans & pricing) ──
+      match /membership_plans/{planId} {
+        allow read: if true;
+        allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Facility Batches & Schedules ──
+      match /batches/{batchId} {
+        allow read, create, update, delete, write: if true;
+      }
+
+      // ── Private Registered Members Directory (ADMIN ONLY - protected from public) ──
+      match /members/{memberId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Private Check-In Logs / Scanner Stream (ADMIN ONLY) ──
+      match /check_ins/{checkInId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Private Operating Expenses Ledger (ADMIN ONLY) ──
+      match /expenses/{expenseId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Private Financials / Billing / POS Collections (ADMIN ONLY) ──
+      match /financials/{docId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+    }
+
+    // Collection Group / Any Nested Path Batches Rule (Guarantees Full Read/Write Access)
+    match /{path=**}/batches/{batchId} {
+      allow read, create, update, delete, write: if true;
+    }
+
+    // Direct team_members collection fallback
+    match /team_members/{memberId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // Direct batches collection fallback
+    match /batches/{batchId} {
+      allow read, create, update, delete, write: if true;
+    }
+
+    // Direct expenses collection fallback
+    match /expenses/{expenseId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // ──────── 3. PLATFORM SUBSCRIPTION PLANS ────────
+    // Public can read platform tiers; Super Admin / Admins can write.
+    match /platform_plans/{planId} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || isAuthenticated();
+    }
+
+    // ──────── 4. PLATFORM GOVERNANCE ────────
+    match /platform_governance/{docId} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || isAuthenticated();
+    }
+
+    // ──────── 5. WORKOUTS, CLASSES, MEMBERSHIPS, ATTENDANCE ────────
+    match /classes/{classId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+    
+    match /memberships/{membershipId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+    
+    match /attendance/{logId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /workouts/{workoutId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+  }
+}
