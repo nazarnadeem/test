@@ -9,8 +9,11 @@ import '../data/models/gym_member_model.dart';
 import '../data/models/gym_expense_model.dart';
 import '../data/models/gym_check_in_model.dart';
 import '../data/models/gym_batch_model.dart';
+import '../data/models/gym_gallery_item_model.dart';
+import '../data/models/push_notification_model.dart';
 import '../data/repositories/auth_repository.dart';
 import '../data/repositories/firebase_auth_service.dart';
+import '../../../core/services/notification_service.dart';
 
 /// Streamlined state manager for GCRM One Authentication and Firebase Login.
 class AuthController extends ChangeNotifier {
@@ -66,6 +69,16 @@ class AuthController extends ChangeNotifier {
   List<GymBatchModel> _batches = [];
   bool _isLoadingBatches = false;
 
+  // Gym Media Gallery (Photos & Videos)
+  List<GymGalleryItemModel> _galleryItems = [];
+  bool _isLoadingGallery = false;
+  static const int maxGalleryItemsLimit = 25;
+
+  // Super Admin Push Notifications
+  List<PushNotificationRecord> _sentNotifications = [];
+  bool _isLoadingNotifications = false;
+  static const int maxBatchUploadLimit = 10;
+
   // --- In-Memory TTL Cache for Firestore Read Reduction ---
   DateTime? _lastTeamFetch;
   DateTime? _lastMembershipPlansFetch;
@@ -73,6 +86,7 @@ class AuthController extends ChangeNotifier {
   DateTime? _lastExpensesFetch;
   DateTime? _lastCheckInsFetch;
   DateTime? _lastBatchesFetch;
+  DateTime? _lastGalleryFetch;
   DateTime? _lastTenantsFetch;
   static const Duration _cacheTtl = Duration(minutes: 5);
 
@@ -106,14 +120,30 @@ class AuthController extends ChangeNotifier {
   bool get isLoadingExpenses => _isLoadingExpenses;
   List<GymCheckInLog> get checkIns => _checkIns;
   bool get isLoadingCheckIns => _isLoadingCheckIns;
+  List<GymGalleryItemModel> get galleryItems => _galleryItems;
+  bool get isLoadingGallery => _isLoadingGallery;
+  int get remainingGallerySlots => (maxGalleryItemsLimit - _galleryItems.length).clamp(0, maxGalleryItemsLimit);
+  bool get isGalleryFull => _galleryItems.length >= maxGalleryItemsLimit;
+
+  List<PushNotificationRecord> get sentNotifications => _sentNotifications;
+  bool get isLoadingNotifications => _isLoadingNotifications;
 
   /// Resolves the active Gym Tenant model for the logged in user
   GymTenantModel? get currentGymTenant {
     final user = currentUser;
     if (user == null) return null;
     final tid = user.tenantId;
-    if (tid != null) {
+    if (tid != null && tid.isNotEmpty) {
       final match = _gymTenants.where((g) => g.id == tid);
+      if (match.isNotEmpty) return match.first;
+    }
+    final email = user.email.toLowerCase().trim();
+    if (email.isNotEmpty) {
+      final match = _gymTenants.where((g) =>
+          g.adminEmail?.toLowerCase().trim() == email ||
+          g.ownerEmail?.toLowerCase().trim() == email ||
+          g.adminId == user.id ||
+          g.ownerId == user.id);
       if (match.isNotEmpty) return match.first;
     }
     if (user.gymName != null && user.gymName!.isNotEmpty) {
@@ -577,7 +607,6 @@ class AuthController extends ChangeNotifier {
     if (!loadNextPage || filterStatus != _memberFilterStatus) {
       _lastMemberDocument = null;
       _currentMembersPage = 1;
-      _members = [];
     }
 
     _memberFilterStatus = filterStatus;
@@ -664,16 +693,13 @@ class AuthController extends ChangeNotifier {
     }
   }
 
-  /// Delete a gym member
+  /// Delete a gym member (marks member as inactive instead of permanent deletion)
   Future<bool> deleteGymMember(String tenantId, String memberId) async {
     try {
-      await _authRepository.deleteGymMember(
-        tenantId: tenantId,
-        memberId: memberId,
-      );
-      _members = _members.where((m) => m.id != memberId).toList();
-      _lastMembersFetch = DateTime.now();
-      notifyListeners();
+      final existing = _members.where((m) => m.id == memberId).firstOrNull;
+      if (existing != null) {
+        return await updateGymMember(existing.copyWith(isActive: false));
+      }
       return true;
     } catch (e) {
       _errorMessage = _cleanErrorMessage(e.toString());
@@ -783,6 +809,7 @@ class AuthController extends ChangeNotifier {
       loadGymBatches(tid, forceRefresh),
       loadGymExpenses(tid, forceRefresh, 50),
       loadGymCheckIns(tid, forceRefresh, 30),
+      loadGymGalleryItems(tid, forceRefresh),
     ]);
   }
 
@@ -842,6 +869,106 @@ class AuthController extends ChangeNotifier {
     }
   }
 
+  // ── Gym Media Gallery Controller Actions ──
+
+  /// Load gallery media items for a specific gym tenant (with TTL caching)
+  Future<void> loadGymGalleryItems([String? tenantId, bool forceRefresh = false]) async {
+    final tid = tenantId ?? activeTenantId;
+    if (tid == null) return;
+
+    if (!forceRefresh && _galleryItems.isNotEmpty && _lastGalleryFetch != null) {
+      if (DateTime.now().difference(_lastGalleryFetch!) < _cacheTtl) {
+        return;
+      }
+    }
+
+    _isLoadingGallery = true;
+    notifyListeners();
+
+    try {
+      _galleryItems = await _authRepository.getGymGalleryItems(tenantId: tid);
+      _lastGalleryFetch = DateTime.now();
+      _errorMessage = null;
+    } catch (e) {
+      _errorMessage = _cleanErrorMessage(e.toString());
+    } finally {
+      _isLoadingGallery = false;
+      notifyListeners();
+    }
+  }
+
+  /// Upload batch of media items (up to 10 at once, capped at 25 total)
+  Future<bool> uploadGymGalleryMedia(List<GymGalleryUploadPayload> items, {String? tenantId}) async {
+    final tid = tenantId ?? activeTenantId;
+    if (tid == null) {
+      _errorMessage = 'No active gym tenant found.';
+      notifyListeners();
+      return false;
+    }
+
+    if (items.isEmpty) return true;
+
+    if (items.length > maxBatchUploadLimit) {
+      _errorMessage = 'Upload limit exceeded. You can upload up to $maxBatchUploadLimit items at one time.';
+      notifyListeners();
+      return false;
+    }
+
+    if (_galleryItems.length + items.length > maxGalleryItemsLimit) {
+      final available = remainingGallerySlots;
+      _errorMessage = 'Gallery limit reached. You can only upload $available more item(s) to reach the $maxGalleryItemsLimit limit.';
+      notifyListeners();
+      return false;
+    }
+
+    _isLoadingGallery = true;
+    notifyListeners();
+
+    try {
+      final uploaded = await _authRepository.uploadGymGalleryItems(
+        tenantId: tid,
+        items: items,
+        uploadedBy: currentUser?.fullName ?? 'Admin',
+      );
+      _galleryItems = [...uploaded, ..._galleryItems];
+      if (_galleryItems.length > maxGalleryItemsLimit) {
+        _galleryItems = _galleryItems.take(maxGalleryItemsLimit).toList();
+      }
+      _lastGalleryFetch = DateTime.now();
+      _errorMessage = null;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      _errorMessage = _cleanErrorMessage(e.toString());
+      notifyListeners();
+      return false;
+    } finally {
+      _isLoadingGallery = false;
+      notifyListeners();
+    }
+  }
+
+  /// Delete a gallery media item
+  Future<bool> deleteGymGalleryItem(String itemId, {String? tenantId}) async {
+    final tid = tenantId ?? activeTenantId;
+    if (tid == null) return false;
+
+    try {
+      await _authRepository.deleteGymGalleryItem(
+        tenantId: tid,
+        itemId: itemId,
+      );
+      _galleryItems = _galleryItems.where((e) => e.id != itemId).toList();
+      _lastGalleryFetch = DateTime.now();
+      notifyListeners();
+      return true;
+    } catch (e) {
+      _errorMessage = _cleanErrorMessage(e.toString());
+      notifyListeners();
+      return false;
+    }
+  }
+
   // --- Actions & Methods ---
 
   /// Initialize and check active session
@@ -859,6 +986,14 @@ class AuthController extends ChangeNotifier {
         _gymTenants = results[0] as List<GymTenantModel>;
         _platformPlans = results[1] as List<PlatformPlanModel>;
         _lastTenantsFetch = DateTime.now();
+
+        // Initialize and bind FCM push notification token for restored session
+        final user = _currentSession!.user;
+        NotificationService.initializeAndSaveToken(
+          user.id,
+          tenantId: user.tenantId,
+          role: user.role.name,
+        );
       } else {
         // Preload plans even for public tier view
         _platformPlans = await _authRepository.getPlatformPlans();
@@ -1076,6 +1211,15 @@ class AuthController extends ChangeNotifier {
       _currentSession = session;
       _isLoading = false;
       notifyListeners();
+
+      // Initialize and bind FCM push notification token upon login
+      final user = session.user;
+      NotificationService.initializeAndSaveToken(
+        user.id,
+        tenantId: user.tenantId,
+        role: user.role.name,
+      );
+
       return true;
     } catch (e) {
       _isLoading = false;
@@ -1149,11 +1293,71 @@ class AuthController extends ChangeNotifier {
     _isLoading = true;
     notifyListeners();
 
+    final userId = currentUser?.id;
     try {
       await _authRepository.logout();
     } finally {
+      if (userId != null) {
+        NotificationService.clearTokenOnLogout(userId);
+      }
       _currentSession = null;
       _isLoading = false;
+      notifyListeners();
+    }
+  }
+
+  /// Load history of push notifications sent by Super Admin
+  Future<void> loadNotificationsHistory() async {
+    _isLoadingNotifications = true;
+    notifyListeners();
+
+    try {
+      final history = await _authRepository.getSentNotificationsHistory();
+      _sentNotifications = List<PushNotificationRecord>.from(history);
+    } catch (e) {
+      debugPrint('Error loading notifications history: $e');
+    } finally {
+      _isLoadingNotifications = false;
+      notifyListeners();
+    }
+  }
+
+  /// Dispatch a push notification broadcast from Super Admin
+  Future<PushNotificationRecord?> sendPushNotification({
+    required String title,
+    required String body,
+    required String targetAudience,
+    String? targetTenantId,
+    String? targetGymName,
+    String sound = 'notification.mp3',
+  }) async {
+    _isLoadingNotifications = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      final senderName = currentUser?.fullName ?? 'Super Admin';
+      final record = await _authRepository.sendSuperAdminPushNotification(
+        title: title,
+        body: body,
+        targetAudience: targetAudience,
+        targetTenantId: targetTenantId,
+        targetGymName: targetGymName,
+        sound: sound,
+        sentByName: senderName,
+      );
+
+      _sentNotifications = [
+        record,
+        ..._sentNotifications.where((item) => item.id != record.id),
+      ];
+      _successMessage = 'Push notification "${record.title}" queued successfully!';
+      return record;
+    } catch (e) {
+      _errorMessage = _cleanErrorMessage(e.toString());
+      return null;
+    } finally {
+      _isLoadingNotifications = false;
       notifyListeners();
     }
   }

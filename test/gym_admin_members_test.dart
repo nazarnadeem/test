@@ -168,6 +168,99 @@ void main() {
       expect(url, isNotNull);
       expect(url!.isNotEmpty, isTrue);
     });
+
+    test('GymMemberModel.fromJson handles Firestore Timestamp, maps, and date strings correctly', () {
+      final now = DateTime.now();
+      final expiry = DateTime(now.year, now.month, now.day).add(const Duration(days: 2));
+
+      // Mock Firestore Timestamp object with .toDate()
+      final mockTimestamp = _MockFirestoreTimestamp(expiry);
+
+      final jsonWithTimestamp = {
+        'id': 'mem_ts_1',
+        'firstName': 'Existing',
+        'lastName': 'Member',
+        'startDate': mockTimestamp,
+        'expiryDate': mockTimestamp,
+        'isActive': true,
+      };
+
+      final member = GymMemberModel.fromJson(jsonWithTimestamp);
+      expect(member.id, 'mem_ts_1');
+      expect(member.expiryDate.year, expiry.year);
+      expect(member.expiryDate.month, expiry.month);
+      expect(member.expiryDate.day, expiry.day);
+      expect(member.daysRemaining, 2);
+      expect(member.isExpiringSoon, isTrue);
+      expect(member.isExpired, isFalse);
+
+      // JSON with map {_seconds: ...}
+      final jsonWithMap = {
+        'id': 'mem_map_1',
+        'firstName': 'Map',
+        'lastName': 'Member',
+        'startDate': {'_seconds': (now.millisecondsSinceEpoch / 1000).toInt()},
+        'expiryDate': {'_seconds': (expiry.millisecondsSinceEpoch / 1000).toInt()},
+      };
+      final memberMap = GymMemberModel.fromJson(jsonWithMap);
+      expect(memberMap.daysRemaining, 2);
+      expect(memberMap.isExpiringSoon, isTrue);
+    });
+
+    test('Calendar day-aware expiry helpers correctly classify today (0d), tomorrow (1d), and past dates', () {
+      final now = DateTime.now();
+      final todayDate = DateTime(now.year, now.month, now.day, 0, 0, 0); // Midnight today
+      final tomorrowDate = DateTime(now.year, now.month, now.day, 0, 0, 0).add(const Duration(days: 1));
+      final yesterdayDate = DateTime(now.year, now.month, now.day, 0, 0, 0).subtract(const Duration(days: 1));
+
+      final todayMember = GymMemberModel(
+        id: 'mem_today',
+        firstName: 'Today',
+        lastName: 'Member',
+        phone: '1234567890',
+        membershipPlan: 'Standard Pass',
+        startDate: now.subtract(const Duration(days: 30)),
+        expiryDate: todayDate,
+      );
+
+      final tomorrowMember = GymMemberModel(
+        id: 'mem_tomorrow',
+        firstName: 'Tomorrow',
+        lastName: 'Member',
+        phone: '1234567891',
+        membershipPlan: 'Standard Pass',
+        startDate: now.subtract(const Duration(days: 30)),
+        expiryDate: tomorrowDate,
+      );
+
+      final yesterdayMember = GymMemberModel(
+        id: 'mem_yesterday',
+        firstName: 'Yesterday',
+        lastName: 'Member',
+        phone: '1234567892',
+        membershipPlan: 'Standard Pass',
+        startDate: now.subtract(const Duration(days: 30)),
+        expiryDate: yesterdayDate,
+      );
+
+      // Expiring today (0d)
+      expect(todayMember.daysRemaining, 0);
+      expect(todayMember.daysUntilExpiry, 0);
+      expect(todayMember.isExpiringSoon, isTrue);
+      expect(todayMember.isExpired, isFalse);
+
+      // Expiring tomorrow (1d)
+      expect(tomorrowMember.daysRemaining, 1);
+      expect(tomorrowMember.daysUntilExpiry, 1);
+      expect(tomorrowMember.isExpiringSoon, isTrue);
+      expect(tomorrowMember.isExpired, isFalse);
+
+      // Expired yesterday (-1d)
+      expect(yesterdayMember.daysRemaining, 0);
+      expect(yesterdayMember.daysUntilExpiry, -1);
+      expect(yesterdayMember.isExpiringSoon, isFalse);
+      expect(yesterdayMember.isExpired, isTrue);
+    });
   });
 
   group('Gym Admin Member Enrollment Widget Tests', () {
@@ -214,7 +307,7 @@ void main() {
       expect(find.text('No Members Enrolled Yet'), findsOneWidget);
 
       // Open Member Enrollment Modal
-      await tester.tap(find.byType(FloatingActionButton));
+      await tester.tap(find.byType(FloatingActionButton).last);
       await tester.pumpAndSettle();
 
       expect(find.text('Enroll New Member'), findsOneWidget);
@@ -265,13 +358,18 @@ void main() {
       await tester.tap(enrollBtn);
       await tester.pumpAndSettle();
 
-      // Verify Member Card appears on dashboard with Goal, Weight, Height and BMI
+      // Verify Member Card appears on dashboard
       expect(find.text('Dominic Toretto'), findsOneWidget);
+      expect(find.textContaining('Titan Pro Annual'), findsWidgets);
+
+      // Tap on member card to expand and reveal full details & actions
+      await tester.tap(find.text('Dominic Toretto'));
+      await tester.pumpAndSettle();
+
       expect(find.textContaining('1327 Ocean Ave'), findsOneWidget);
       expect(find.textContaining('92.5 kg'), findsOneWidget);
       expect(find.textContaining('182 cm'), findsOneWidget);
       expect(find.textContaining('Letty Ortiz'), findsOneWidget);
-      expect(find.textContaining('Titan Pro Annual'), findsWidgets);
 
       // Verify Check In button on Member Card works
       final checkInBtn = find.text('Check In');
@@ -300,7 +398,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // Open Member Enrollment Modal
-      await tester.tap(find.byType(FloatingActionButton));
+      await tester.tap(find.byType(FloatingActionButton).last);
       await tester.pumpAndSettle();
 
       // Toggle 'Is Lifetime Free Member'
@@ -351,7 +449,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // Enroll an initial member
-      await tester.tap(find.byType(FloatingActionButton));
+      await tester.tap(find.byType(FloatingActionButton).last);
       await tester.pumpAndSettle();
 
       final firstNameField = find.widgetWithText(TextFormField, 'e.g. Jordan');
@@ -379,6 +477,10 @@ void main() {
       // Search for Clark Kent to focus directly on Clark's card
       final searchField = find.widgetWithText(TextFormField, 'Search members by name, phone, or plan...');
       await tester.enterText(searchField, 'Clark');
+      await tester.pumpAndSettle();
+
+      // Tap to expand card
+      await tester.tap(find.text('Clark Kent'));
       await tester.pumpAndSettle();
 
       // Tap Edit button on member card
@@ -442,7 +544,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // 2. Open Add Member Dialog
-      await tester.tap(find.byType(FloatingActionButton));
+      await tester.tap(find.byType(FloatingActionButton).last);
       await tester.pumpAndSettle();
 
       // Tap 'Demo Photo' button in Add Member modal
@@ -478,6 +580,10 @@ void main() {
       await tester.enterText(searchField, 'Diana');
       await tester.pumpAndSettle();
 
+      // Tap to expand card
+      await tester.tap(find.text('Diana Prince'));
+      await tester.pumpAndSettle();
+
       final editBtn = find.text('Edit');
       expect(editBtn, findsOneWidget);
       await tester.tap(editBtn);
@@ -502,5 +608,468 @@ void main() {
       expect(updatedMember.photoUrl, isNotNull);
       expect(updatedMember.photoUrl!.isNotEmpty, isTrue);
     });
+
+    testWidgets('Members cannot be deleted; can be toggled inactive and active instead', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 1600));
+
+      final activeMember = GymMemberModel(
+        id: 'mem_inact_test',
+        tenantId: 'tenant_metro_01',
+        firstName: 'Clark',
+        lastName: 'Kent',
+        phone: '+91 99000 11223',
+        email: 'clark@dailyplanet.com',
+        membershipPlan: 'Pro Plan',
+        startDate: DateTime.now(),
+        expiryDate: DateTime.now().add(const Duration(days: 60)),
+        isActive: true,
+      );
+      await authController.addGymMember(activeMember);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Go to Members tab
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      // Filter to Clark Kent
+      final searchField = find.widgetWithText(TextFormField, 'Search members by name, phone, or plan...');
+      await tester.enterText(searchField, 'Clark');
+      await tester.pumpAndSettle();
+
+      expect(find.text('Clark Kent'), findsOneWidget);
+
+      // Tap to expand card
+      await tester.tap(find.text('Clark Kent'));
+      await tester.pumpAndSettle();
+
+      // Verify there is NO delete button for members
+      expect(find.widgetWithIcon(IconButton, Icons.delete_outline_rounded), findsNothing);
+
+      // Verify 'Set Inactive' button exists
+      final setInactiveBtn = find.text('Set Inactive');
+      expect(setInactiveBtn, findsOneWidget);
+
+      // Tap 'Set Inactive'
+      await tester.tap(setInactiveBtn);
+      await tester.pumpAndSettle();
+
+      // Verify confirmation dialog
+      expect(find.text('Set Member Inactive?'), findsOneWidget);
+      expect(find.textContaining('Members cannot be deleted'), findsOneWidget);
+
+      // Confirm Set Inactive
+      final confirmBtn = find.widgetWithText(ElevatedButton, 'Set Inactive');
+      await tester.tap(confirmBtn);
+      await tester.pumpAndSettle();
+
+      // Verify member is now inactive in AuthController
+      final memberInController = authController.members.firstWhere((m) => m.id == 'mem_inact_test');
+      expect(memberInController.isActive, false);
+
+      // Verify status pill shows 'Inactive' (plus the 'Inactive' filter chip)
+      expect(find.text('Inactive'), findsNWidgets(2));
+
+      // Verify button changed to 'Set Active'
+      expect(find.text('Set Active'), findsOneWidget);
+
+      // Test Inactive filter tab
+      await tester.tap(find.widgetWithText(ChoiceChip, 'Inactive'));
+      await tester.pumpAndSettle();
+      expect(find.text('Clark Kent'), findsOneWidget);
+
+      // Test Active filter tab (Clark Kent should not be shown)
+      await tester.tap(find.widgetWithText(ChoiceChip, 'Active'));
+      await tester.pumpAndSettle();
+      expect(find.text('Clark Kent'), findsNothing);
+
+      // Go back to Inactive and reactivate
+      await tester.tap(find.widgetWithText(ChoiceChip, 'Inactive'));
+      await tester.pumpAndSettle();
+      expect(find.text('Clark Kent'), findsOneWidget);
+
+      // Tap to expand card
+      await tester.tap(find.text('Clark Kent'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Set Active'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Activate Member?'), findsOneWidget);
+      final activateConfirmBtn = find.widgetWithText(ElevatedButton, 'Activate');
+      await tester.tap(activateConfirmBtn);
+      await tester.pumpAndSettle();
+
+      // Verify member is now active again
+      expect(authController.members.firstWhere((m) => m.id == 'mem_inact_test').isActive, true);
+    });
+
+    testWidgets('While adding members, batch dropdown only displays batches that haven\'t crossed member limit',
+        (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      // Pre-seed two batches:
+      // 1. Full batch (limit: 2, enrolled: 2) -> must be hidden
+      await authController.addGymBatch(
+        const GymBatchModel(
+          id: 'btch_full_limit',
+          name: 'Full Capacity Batch',
+          time: '06:00 AM - 07:00 AM',
+          limit: 2,
+          memberIds: ['m1', 'm2'],
+          memberNames: ['Member 1', 'Member 2'],
+        ),
+      );
+
+      // 2. Available batch (limit: 10, enrolled: 1) -> must be shown
+      await authController.addGymBatch(
+        const GymBatchModel(
+          id: 'btch_available_slots',
+          name: 'Available Slots Batch',
+          time: '07:00 AM - 08:00 AM',
+          limit: 10,
+          memberIds: ['m3'],
+          memberNames: ['Member 3'],
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Go to Members Tab
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      // Open Member Enrollment Modal
+      await tester.tap(find.byType(FloatingActionButton).last);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Enroll New Member'), findsOneWidget);
+
+      // Find the batch dropdown
+      final dropdownFinder = find.byType(DropdownButton<String?>);
+      expect(dropdownFinder, findsWidgets);
+
+      // Tap the Assigned Batch dropdown
+      await tester.tap(dropdownFinder.last);
+      await tester.pumpAndSettle();
+
+      // The available batch must be present
+      expect(find.text('Available Slots Batch (07:00 AM - 08:00 AM)'), findsWidgets);
+
+      // The full batch that crossed limit must NOT be present
+      expect(find.text('Full Capacity Batch (06:00 AM - 07:00 AM)'), findsNothing);
+
+      // Select 'Available Slots Batch'
+      await tester.tap(find.text('Available Slots Batch (07:00 AM - 08:00 AM)').last);
+      await tester.pumpAndSettle();
+
+      // Verify selected batch is shown
+      expect(find.text('Available Slots Batch (07:00 AM - 08:00 AM)'), findsOneWidget);
+    });
+
+    testWidgets('Expiring filter shows 1D, 3D, and 7D sub-filters and filters members accordingly',
+        (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final now = DateTime.now();
+
+      // Member 1: Expires in ~1 day (hours: 20 -> difference.inDays == 0 or 1, daysRemaining <= 1)
+      await authController.addGymMember(
+        GymMemberModel(
+          id: 'mem_exp_1d',
+          firstName: 'Alex',
+          lastName: 'OneDay',
+          phone: '+91 90000 00001',
+          membershipPlan: 'Standard Pass',
+          startDate: now.subtract(const Duration(days: 30)),
+          expiryDate: now.add(const Duration(hours: 20)),
+          isActive: true,
+        ),
+      );
+
+      // Member 2: Expires in ~3 days (days: 2, hours: 12 -> daysRemaining == 2, so <= 3)
+      await authController.addGymMember(
+        GymMemberModel(
+          id: 'mem_exp_3d',
+          firstName: 'Brian',
+          lastName: 'ThreeDays',
+          phone: '+91 90000 00002',
+          membershipPlan: 'Standard Pass',
+          startDate: now.subtract(const Duration(days: 30)),
+          expiryDate: now.add(const Duration(days: 2, hours: 12)),
+          isActive: true,
+        ),
+      );
+
+      // Member 3: Expires in ~6 days (days: 5, hours: 12 -> daysRemaining == 5, so <= 7)
+      await authController.addGymMember(
+        GymMemberModel(
+          id: 'mem_exp_7d',
+          firstName: 'Chloe',
+          lastName: 'SevenDays',
+          phone: '+91 90000 00003',
+          membershipPlan: 'Standard Pass',
+          startDate: now.subtract(const Duration(days: 30)),
+          expiryDate: now.add(const Duration(days: 5, hours: 12)),
+          isActive: true,
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Go to Members Tab
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      // Initially on 'All' filter -> sub-filters (1D, 3D, 7D) must not be visible
+      expect(find.text('1D'), findsNothing);
+      expect(find.text('3D'), findsNothing);
+      expect(find.text('7D'), findsNothing);
+
+      // Tap 'Expiring' filter chip
+      await tester.tap(find.widgetWithText(ChoiceChip, 'Expiring'));
+      await tester.pumpAndSettle();
+
+      // Sub-filters should now be visible below the main filters
+      expect(find.textContaining('Expiring in'), findsOneWidget);
+      expect(find.widgetWithText(ChoiceChip, '1D'), findsOneWidget);
+      expect(find.widgetWithText(ChoiceChip, '3D'), findsOneWidget);
+      expect(find.widgetWithText(ChoiceChip, '7D'), findsOneWidget);
+
+      // By default, '7D' is selected -> all 3 expiring members should be visible
+      expect(find.text('Alex OneDay'), findsOneWidget);
+      expect(find.text('Brian ThreeDays'), findsOneWidget);
+      expect(find.text('Chloe SevenDays'), findsOneWidget);
+
+      // Select '3D' sub-filter
+      await tester.tap(find.widgetWithText(ChoiceChip, '3D'));
+      await tester.pumpAndSettle();
+
+      // 1D and 3D members should be visible, 7D member filtered out
+      expect(find.text('Alex OneDay'), findsOneWidget);
+      expect(find.text('Brian ThreeDays'), findsOneWidget);
+      expect(find.text('Chloe SevenDays'), findsNothing);
+
+      // Select '1D' sub-filter
+      await tester.tap(find.widgetWithText(ChoiceChip, '1D'));
+      await tester.pumpAndSettle();
+
+      // Only 1D member should be visible
+      expect(find.text('Alex OneDay'), findsOneWidget);
+      expect(find.text('Brian ThreeDays'), findsNothing);
+      expect(find.text('Chloe SevenDays'), findsNothing);
+
+      // Switch back to 'All' filter
+      await tester.tap(find.widgetWithText(ChoiceChip, 'All'));
+      await tester.pumpAndSettle();
+
+      // Sub-filters should be hidden again
+      expect(find.text('1D'), findsNothing);
+      expect(find.text('3D'), findsNothing);
+      expect(find.text('7D'), findsNothing);
+
+      // All members should be visible
+      expect(find.text('Alex OneDay'), findsOneWidget);
+      expect(find.text('Brian ThreeDays'), findsOneWidget);
+      expect(find.text('Chloe SevenDays'), findsOneWidget);
+    });
+
+    testWidgets('Member card renders without RenderFlex overflow on standard mobile screens',
+        (WidgetTester tester) async {
+      // Standard mobile phone viewport: 390x844 (iPhone 12/13/14/15)
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      // Enroll a member so a card is displayed
+      await authController.addGymMember(
+        GymMemberModel(
+          id: 'mem_marcus',
+          firstName: 'Marcus',
+          lastName: 'Aurelius',
+          phone: '+91 99999 88888',
+          membershipPlan: 'Titan Pro Annual',
+          startDate: DateTime.now().subtract(const Duration(days: 10)),
+          expiryDate: DateTime.now().add(const Duration(days: 350)),
+          isActive: true,
+          totalCheckIns: 5,
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(
+            authController: authController,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Ensure members tab is visible
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      // Tap member card to expand it
+      await tester.tap(find.text('Marcus Aurelius'));
+      await tester.pumpAndSettle();
+
+      // Verify buttons exist and no overflow exceptions were logged
+      expect(find.text('Check In'), findsWidgets);
+      expect(find.text('Edit'), findsWidgets);
+      expect(find.text('Set Inactive'), findsWidgets);
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('Member items are collapsible by default and only one expands at a time',
+        (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      // Seed Member A and Member B
+      await authController.addGymMember(
+        GymMemberModel(
+          id: 'mem_alpha',
+          firstName: 'Alpha',
+          lastName: 'User',
+          phone: '+91 11111 22222',
+          membershipPlan: 'Standard Pass',
+          startDate: DateTime.now().subtract(const Duration(days: 10)),
+          expiryDate: DateTime.now().add(const Duration(days: 20)),
+          isActive: true,
+          address: 'Alpha Secret Base 42',
+        ),
+      );
+
+      await authController.addGymMember(
+        GymMemberModel(
+          id: 'mem_beta',
+          firstName: 'Beta',
+          lastName: 'User',
+          phone: '+91 33333 44444',
+          membershipPlan: 'Standard Pass',
+          startDate: DateTime.now().subtract(const Duration(days: 5)),
+          expiryDate: DateTime.now().add(const Duration(days: 25)),
+          isActive: true,
+          address: 'Beta Secret Base 99',
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      // 1. By default, both members are collapsed:
+      // Important summary info is visible
+      expect(find.text('Alpha User'), findsOneWidget);
+      expect(find.text('Beta User'), findsOneWidget);
+      expect(find.text('+91 11111 22222'), findsOneWidget);
+      expect(find.text('+91 33333 44444'), findsOneWidget);
+
+      // Expanded details (like addresses and action buttons) must NOT be visible yet
+      expect(find.text('Alpha Secret Base 42'), findsNothing);
+      expect(find.text('Beta Secret Base 99'), findsNothing);
+      expect(find.text('Check In'), findsNothing);
+
+      // 2. Expand Member Alpha
+      await tester.tap(find.text('Alpha User'));
+      await tester.pumpAndSettle();
+
+      // Member Alpha is now expanded
+      expect(find.text('Alpha Secret Base 42'), findsOneWidget);
+      expect(find.text('Check In'), findsOneWidget);
+      // Member Beta remains collapsed
+      expect(find.text('Beta Secret Base 99'), findsNothing);
+
+      // 3. Tap Member Beta: Only ONE expands at a time (accordion)
+      await tester.tap(find.text('Beta User'));
+      await tester.pumpAndSettle();
+
+      // Member Beta is now expanded
+      expect(find.text('Beta Secret Base 99'), findsOneWidget);
+      // Member Alpha was automatically collapsed!
+      expect(find.text('Alpha Secret Base 42'), findsNothing);
+
+      // 4. Tap Member Beta again: collapses Beta
+      await tester.tap(find.text('Beta User'));
+      await tester.pumpAndSettle();
+
+      // Both are collapsed again
+      expect(find.text('Beta Secret Base 99'), findsNothing);
+      expect(find.text('Alpha Secret Base 42'), findsNothing);
+      expect(find.text('Check In'), findsNothing);
+    });
+
+    testWidgets('Plan start date cannot be in the future when adding or editing member',
+        (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      // Open Member Enrollment Modal
+      await tester.tap(find.byType(FloatingActionButton).last);
+      await tester.pumpAndSettle();
+
+      // Tap on starting date to open date picker
+      final datePickerButton = find.byIcon(Icons.edit_calendar_rounded);
+      expect(datePickerButton, findsOneWidget);
+      await tester.ensureVisible(datePickerButton);
+      await tester.tap(datePickerButton);
+      await tester.pumpAndSettle();
+
+      // Date picker help text should show up to today restriction
+      expect(find.text('SELECT PLAN START DATE (UP TO TODAY)'), findsOneWidget);
+
+      // Close date picker
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+    });
   });
+}
+
+class _MockFirestoreTimestamp {
+  final DateTime _date;
+  _MockFirestoreTimestamp(this._date);
+  DateTime toDate() => _date;
 }

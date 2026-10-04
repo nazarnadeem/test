@@ -140,5 +140,43 @@ void main() {
       expect(checkIns.first.memberName, 'Alex Rivera');
       expect(checkIns.first.method, 'QR Scan');
     });
+
+    test('login with gym admin credentials resolves to gymOwner and isSuperAdmin is false', () async {
+      final session = await firebaseAuthService.login(
+        email: 'owner@metrofitness.com',
+        password: 'Owner@Metro2026',
+      );
+
+      expect(session.user.role, equals(UserRole.gymOwner));
+      expect(session.user.isSuperAdmin, isFalse);
+      expect(session.user.isGymOwner, isTrue);
+      expect(session.user.tenantId, equals('tenant_metro_01'));
+    });
+
+    test('UserModel with tenantId cannot be Super Admin even if json sets isSuperAdmin true', () {
+      final model = UserModel.fromJson({
+        'id': 'usr_test_gym_admin',
+        'email': 'gymadmin@example.com',
+        'fullName': 'Test Gym Admin',
+        'role': 'superAdmin',
+        'isSuperAdmin': true,
+        'tenantId': 'tenant_test_123',
+        'gymName': 'Test Fitness Club',
+      });
+
+      expect(model.isSuperAdmin, isFalse);
+      expect(model.role, equals(UserRole.gymOwner));
+      expect(model.isGymOwner, isTrue);
+    });
+
+    test('UserRoleExtension.fromString parses roles correctly', () {
+      expect(UserRoleExtension.fromString('superadmin'), equals(UserRole.superAdmin));
+      expect(UserRoleExtension.fromString('super_admin'), equals(UserRole.superAdmin));
+      expect(UserRoleExtension.fromString('gymowner'), equals(UserRole.gymOwner));
+      expect(UserRoleExtension.fromString('gym_admin'), equals(UserRole.gymOwner));
+      expect(UserRoleExtension.fromString('admin'), equals(UserRole.gymOwner));
+      expect(UserRoleExtension.fromString('trainer'), equals(UserRole.trainer));
+      expect(UserRoleExtension.fromString('member'), equals(UserRole.member));
+    });
   });
 }

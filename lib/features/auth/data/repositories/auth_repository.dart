@@ -8,6 +8,8 @@ import '../models/gym_member_model.dart';
 import '../models/gym_expense_model.dart';
 import '../models/gym_check_in_model.dart';
 import '../models/gym_batch_model.dart';
+import '../models/gym_gallery_item_model.dart';
+import '../models/push_notification_model.dart';
 
 /// Abstract contract for Authentication & Tenant Onboarding in GCRM One.
 /// Can be implemented by MockAuthService, FirebaseAuthService, SupabaseAuthService,
@@ -330,4 +332,39 @@ abstract class AuthRepository {
     required String tenantId,
     required String expenseId,
   });
+
+  // ── Gym Media Gallery Methods ──
+  /// Fetch gallery media items for a specific gym tenant (capped at 25 total)
+  Future<List<GymGalleryItemModel>> getGymGalleryItems({
+    required String tenantId,
+  });
+
+  /// Upload batch of gallery items (up to 10 at once, optimized before upload)
+  Future<List<GymGalleryItemModel>> uploadGymGalleryItems({
+    required String tenantId,
+    required List<GymGalleryUploadPayload> items,
+    String uploadedBy = 'Admin',
+  });
+
+  /// Delete a media item from the gym gallery
+  Future<void> deleteGymGalleryItem({
+    required String tenantId,
+    required String itemId,
+  });
+
+  // ── Super Admin Push Notification Methods ──
+  /// Send a platform-wide, role-based, or gym-specific push notification broadcast
+  Future<PushNotificationRecord> sendSuperAdminPushNotification({
+    required String title,
+    required String body,
+    required String targetAudience,
+    String? targetTenantId,
+    String? targetGymName,
+    String sound = 'notification.mp3',
+    String? sentByName,
+  });
+
+  /// Fetch history of push notifications sent by Super Admin
+  Future<List<PushNotificationRecord>> getSentNotificationsHistory({int limit = 50});
 }
+

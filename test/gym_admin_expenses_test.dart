@@ -106,8 +106,8 @@ void main() {
       await tester.tap(find.text('Expenses'));
       await tester.pumpAndSettle();
 
-      // Tap FAB button
-      await tester.tap(find.byType(FloatingActionButton));
+      // Tap FAB button (action FAB on the right)
+      await tester.tap(find.byType(FloatingActionButton).last);
       await tester.pumpAndSettle();
 
       // Verify modal opened

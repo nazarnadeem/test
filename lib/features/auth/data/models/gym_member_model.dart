@@ -165,22 +165,32 @@ class GymMemberModel {
     return DateFormat('dd MMM yyyy').format(startDate);
   }
 
+  /// Number of calendar days from today until expiry date (0 = expires today, 1 = tomorrow, -1 = expired yesterday)
+  int get daysUntilExpiry {
+    if (isLifetimeFree) return 99999;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final localExpiry = expiryDate.toLocal();
+    final expiryDay = DateTime(localExpiry.year, localExpiry.month, localExpiry.day);
+    return expiryDay.difference(today).inDays;
+  }
+
   /// Expiry status helpers
   bool get isExpiringSoon {
-    if (isLifetimeFree) return false;
-    final daysLeft = expiryDate.difference(DateTime.now()).inDays;
-    return daysLeft >= 0 && daysLeft <= 7;
+    if (isLifetimeFree || !isActive) return false;
+    final days = daysUntilExpiry;
+    return days >= 0 && days <= 7;
   }
 
   bool get isExpired {
     if (isLifetimeFree) return false;
-    return expiryDate.isBefore(DateTime.now());
+    return daysUntilExpiry < 0;
   }
 
   int get daysRemaining {
     if (isLifetimeFree) return 99999;
-    final diff = expiryDate.difference(DateTime.now()).inDays;
-    return diff > 0 ? diff : 0;
+    final days = daysUntilExpiry;
+    return days >= 0 ? days : 0;
   }
 
   /// Check if emergency contact details are provided
@@ -226,8 +236,25 @@ class GymMemberModel {
   factory GymMemberModel.fromJson(Map<String, dynamic> json, [String? docId]) {
     DateTime? parseDate(dynamic val) {
       if (val == null) return null;
-      if (val is String) return DateTime.tryParse(val);
-      if (val is int) return DateTime.fromMillisecondsSinceEpoch(val);
+      if (val is DateTime) return val.toLocal();
+      if (val is String) {
+        final parsed = DateTime.tryParse(val);
+        if (parsed != null) return parsed.toLocal();
+      }
+      if (val is int) return DateTime.fromMillisecondsSinceEpoch(val).toLocal();
+      try {
+        final res = (val as dynamic).toDate();
+        if (res is DateTime) return res.toLocal();
+      } catch (_) {}
+      if (val is Map) {
+        final seconds = val['_seconds'] ?? val['seconds'];
+        if (seconds is int) {
+          return DateTime.fromMillisecondsSinceEpoch(seconds * 1000).toLocal();
+        }
+      }
+      try {
+        return DateTime.tryParse(val.toString())?.toLocal();
+      } catch (_) {}
       return null;
     }
 
@@ -291,6 +318,8 @@ class GymMemberModel {
     );
   }
 
+  static const Object _sentinel = Object();
+
   GymMemberModel copyWith({
     String? id,
     String? tenantId,
@@ -310,8 +339,9 @@ class GymMemberModel {
     String? emergencyContactRelation,
     String? membershipPlanId,
     String? membershipPlan,
-    String? batchId,
-    String? batchName,
+    Object? batchId = _sentinel,
+    Object? batchName = _sentinel,
+    bool clearBatch = false,
     bool? isLifetimeFree,
     DateTime? startDate,
     DateTime? expiryDate,
@@ -342,8 +372,12 @@ class GymMemberModel {
       emergencyContactRelation: emergencyContactRelation ?? this.emergencyContactRelation,
       membershipPlanId: membershipPlanId ?? this.membershipPlanId,
       membershipPlan: membershipPlan ?? this.membershipPlan,
-      batchId: batchId ?? this.batchId,
-      batchName: batchName ?? this.batchName,
+      batchId: clearBatch
+          ? null
+          : (identical(batchId, _sentinel) ? this.batchId : batchId as String?),
+      batchName: clearBatch
+          ? null
+          : (identical(batchName, _sentinel) ? this.batchName : batchName as String?),
       isLifetimeFree: isLifetimeFree ?? this.isLifetimeFree,
       startDate: startDate ?? this.startDate,
       expiryDate: expiryDate ?? this.expiryDate,

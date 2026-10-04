@@ -66,5 +66,16 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+		<string>remote-notification</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Camera access is needed to scan member QR codes for fast check-in and capture profile photos.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Photo library access is needed to select member profile photos and showcase gallery photos and videos.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Microphone access is needed for recording gym workout reels and videos.</string>
 </dict>
 </plist>

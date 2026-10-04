@@ -1,8 +1,10 @@
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import '../../../../core/constants/app_strings.dart';
 import '../../../../core/utils/image_optimizer.dart';
 import '../models/user_model.dart';
 import '../models/gym_tenant_model.dart';
@@ -14,6 +16,8 @@ import '../models/gym_member_model.dart';
 import '../models/gym_expense_model.dart';
 import '../models/gym_check_in_model.dart';
 import '../models/gym_batch_model.dart';
+import '../models/gym_gallery_item_model.dart';
+import '../models/push_notification_model.dart';
 import 'auth_repository.dart';
 import 'mock_auth_service.dart';
 
@@ -273,6 +277,7 @@ class FirebaseAuthService implements AuthRepository {
         'fullName': adminName,
         'phoneNumber': phone,
         'role': UserRole.gymOwner.name,
+        'isSuperAdmin': false,
         'tenantId': tenantId,
         'gymName': gymName,
         'permissions': [
@@ -403,7 +408,7 @@ class FirebaseAuthService implements AuthRepository {
         await fbUser.updateDisplayName(fullName);
       } catch (_) {}
 
-      final orgName = organization ?? 'GCRM ONE Global Platform';
+      final orgName = organization ?? '';
       const permissions = [
         'manage_all_tenants',
         'approve_gym_vendors',
@@ -423,7 +428,7 @@ class FirebaseAuthService implements AuthRepository {
         'isSuperAdmin': true,
         'tenantId': null,
         'gymName': orgName,
-        'securityPin': securityPin ?? '884920',
+        'securityPin': securityPin ?? '',
         'permissions': permissions,
         'isActive': true,
         'createdAt': FieldValue.serverTimestamp(),
@@ -565,6 +570,299 @@ class FirebaseAuthService implements AuthRepository {
     }
   }
 
+  /// Resolves the authenticated user's account role, tenant affiliation, and profile.
+  /// Gym admins and staff are strictly bound to their tenant; unverified users will never
+  /// be promoted to Super Admin.
+  Future<UserModel> _resolveUserAccount({
+    required String uid,
+    required String normalizedEmail,
+    String? displayName,
+    String? phoneNumber,
+    UserRole? requestedRole,
+  }) async {
+    const defaultGymAdminPermissions = [
+      'manage_gym_members',
+      'manage_trainers',
+      'view_gym_analytics',
+      'process_memberships',
+    ];
+
+    const defaultSuperAdminPermissions = [
+      'manage_all_tenants',
+      'approve_gym_vendors',
+      'view_global_revenue',
+      'manage_system_settings',
+      'manage_global_trainers',
+      'manage_security_keys',
+    ];
+
+    // 1. Cross-reference Tenants collection to see if this user owns/admins a gym
+    try {
+      QuerySnapshot<Map<String, dynamic>>? snap;
+      snap = await firestore
+          .collection('tenants')
+          .where('adminEmail', isEqualTo: normalizedEmail)
+          .limit(1)
+          .get();
+      if (snap.docs.isEmpty) {
+        snap = await firestore
+            .collection('tenants')
+            .where('ownerEmail', isEqualTo: normalizedEmail)
+            .limit(1)
+            .get();
+      }
+      if (snap.docs.isEmpty) {
+        snap = await firestore
+            .collection('tenants')
+            .where('adminId', isEqualTo: uid)
+            .limit(1)
+            .get();
+      }
+      if (snap.docs.isEmpty) {
+        snap = await firestore
+            .collection('tenants')
+            .where('ownerId', isEqualTo: uid)
+            .limit(1)
+            .get();
+      }
+
+      if (snap.docs.isNotEmpty) {
+        final tenantDoc = snap.docs.first;
+        final tenantData = tenantDoc.data();
+        final tenantId = tenantDoc.id;
+        final gymName = (tenantData['gymName'] as String?)?.trim() ?? 'Partner Gym';
+        final resolvedName = (tenantData['adminName'] as String?)?.trim() ??
+            (tenantData['ownerName'] as String?)?.trim() ??
+            displayName ??
+            'Gym Admin';
+        final resolvedPhone = (tenantData['phone'] as String?)?.trim() ?? phoneNumber ?? '';
+
+        final userModel = UserModel(
+          id: uid,
+          email: normalizedEmail,
+          fullName: resolvedName,
+          phoneNumber: resolvedPhone,
+          role: UserRole.gymOwner,
+          tenantId: tenantId,
+          gymName: gymName,
+          createdAt: DateTime.now(),
+          permissions: defaultGymAdminPermissions,
+        );
+
+        // Self-heal users/{uid} document with gymOwner and tenantId
+        try {
+          await firestore.collection('users').doc(uid).set(
+            {
+              'id': uid,
+              'email': normalizedEmail,
+              'fullName': resolvedName,
+              'phoneNumber': resolvedPhone,
+              'role': UserRole.gymOwner.name,
+              'isSuperAdmin': false,
+              'tenantId': tenantId,
+              'gymName': gymName,
+              'permissions': defaultGymAdminPermissions,
+              'isActive': true,
+              'updatedAt': FieldValue.serverTimestamp(),
+            },
+            SetOptions(merge: true),
+          );
+
+          if (tenantData['adminId'] != uid) {
+            await firestore.collection('tenants').doc(tenantId).update({'adminId': uid});
+          }
+        } catch (e) {
+          debugPrint('Firestore self-healing tenant sync note: $e');
+        }
+
+        return userModel;
+      }
+    } catch (e) {
+      debugPrint('Firestore tenant resolution check note: $e');
+    }
+
+    // 2. Check if a users record exists by UID
+    try {
+      final docSnap = await firestore.collection('users').doc(uid).get();
+      if (docSnap.exists && docSnap.data() != null) {
+        final data = docSnap.data()!;
+        data['id'] = uid;
+        final rawRole = (data['role'] as String?)?.toLowerCase();
+        final rawTenantId = data['tenantId'] as String?;
+        final isSuper = data['isSuperAdmin'] == true;
+
+        // If the user has a tenantId, they can NEVER be a Super Admin
+        if (rawTenantId != null && rawTenantId.isNotEmpty) {
+          return UserModel.fromJson(data);
+        }
+
+        // If record claimed superAdmin, verify against master superadmin email or governance
+        if (rawRole == 'superadmin' || isSuper) {
+          final isMasterEmail = normalizedEmail == AppStrings.demoSuperAdminEmail.toLowerCase();
+          final isExplicitSuper = requestedRole == UserRole.superAdmin;
+          if (isMasterEmail || isExplicitSuper) {
+            return UserModel.fromJson(data);
+          }
+
+          // Check if governance document recognizes them
+          try {
+            final govDoc = await firestore.collection('platform_governance').doc('superadmin').get();
+            if (govDoc.exists) {
+              final masterUid = govDoc.data()?['masterAdminUid'] as String?;
+              final masterEmail = (govDoc.data()?['masterAdminEmail'] as String?)?.toLowerCase();
+              if (masterUid == uid || masterEmail == normalizedEmail) {
+                return UserModel.fromJson(data);
+              }
+            }
+          } catch (_) {}
+
+          // Corrupted / orphaned fallback: If not verified as superadmin, downgrade to gymOwner
+          debugPrint('Notice: Downgrading unverified superAdmin record for $normalizedEmail to gymOwner');
+          final healedData = Map<String, dynamic>.from(data);
+          healedData['role'] = UserRole.gymOwner.name;
+          healedData['isSuperAdmin'] = false;
+          try {
+            await firestore.collection('users').doc(uid).update({
+              'role': UserRole.gymOwner.name,
+              'isSuperAdmin': false,
+            });
+          } catch (_) {}
+          return UserModel.fromJson(healedData);
+        }
+
+        return UserModel.fromJson(data);
+      }
+    } catch (e) {
+      debugPrint('Firestore user doc read note: $e');
+    }
+
+    // 3. Check if user document exists under a generated ID (e.g. usr_admin_...) with matching email
+    try {
+      final queryByEmail = await firestore
+          .collection('users')
+          .where('email', isEqualTo: normalizedEmail)
+          .limit(3)
+          .get();
+      for (final doc in queryByEmail.docs) {
+        if (doc.id != uid) {
+          final existingData = doc.data();
+          final tid = existingData['tenantId'] as String?;
+          if (tid != null && tid.isNotEmpty) {
+            final gymName = existingData['gymName'] as String? ?? 'Partner Gym';
+            final fullName = existingData['fullName'] as String? ?? displayName ?? 'Gym Admin';
+            final phone = existingData['phoneNumber'] as String? ?? phoneNumber ?? '';
+            final role = UserRoleExtension.fromString(existingData['role'] as String?);
+
+            final userModel = UserModel(
+              id: uid,
+              email: normalizedEmail,
+              fullName: fullName,
+              phoneNumber: phone,
+              role: role == UserRole.superAdmin ? UserRole.gymOwner : role,
+              tenantId: tid,
+              gymName: gymName,
+              createdAt: DateTime.now(),
+              permissions: (existingData['permissions'] as List<dynamic>?)
+                      ?.map((e) => e.toString())
+                      .toList() ??
+                  defaultGymAdminPermissions,
+            );
+
+            // Copy to users/{uid}
+            try {
+              await firestore.collection('users').doc(uid).set({
+                'id': uid,
+                'email': normalizedEmail,
+                'fullName': fullName,
+                'phoneNumber': phone,
+                'role': userModel.role.name,
+                'isSuperAdmin': false,
+                'tenantId': tid,
+                'gymName': gymName,
+                'permissions': userModel.permissions,
+                'isActive': true,
+                'updatedAt': FieldValue.serverTimestamp(),
+              }, SetOptions(merge: true));
+            } catch (_) {}
+
+            return userModel;
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('Firestore secondary user lookup note: $e');
+    }
+
+    // 4. Missing user record entirely: create appropriate new user record
+    final isMasterSuperAdmin = normalizedEmail == AppStrings.demoSuperAdminEmail.toLowerCase() ||
+        requestedRole == UserRole.superAdmin;
+
+    if (isMasterSuperAdmin) {
+      final name = displayName ?? 'Platform Super Admin';
+      final superUserModel = UserModel(
+        id: uid,
+        email: normalizedEmail,
+        fullName: name,
+        phoneNumber: phoneNumber ?? '+1 (800) 555-0199',
+        role: UserRole.superAdmin,
+        gymName: 'GCRM ONE Global Platform',
+        createdAt: DateTime.now(),
+        permissions: defaultSuperAdminPermissions,
+      );
+
+      try {
+        await firestore.collection('users').doc(uid).set({
+          'id': uid,
+          'email': normalizedEmail,
+          'fullName': name,
+          'phoneNumber': phoneNumber ?? '+1 (800) 555-0199',
+          'role': UserRole.superAdmin.name,
+          'isSuperAdmin': true,
+          'tenantId': null,
+          'gymName': 'GCRM ONE Global Platform',
+          'permissions': defaultSuperAdminPermissions,
+          'isActive': true,
+          'createdAt': FieldValue.serverTimestamp(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+      } catch (_) {}
+
+      return superUserModel;
+    }
+
+    // Default for any regular user/gym admin logging in without a record
+    final gymAdminName = displayName ?? 'Gym Admin';
+    final fallbackGymAdmin = UserModel(
+      id: uid,
+      email: normalizedEmail,
+      fullName: gymAdminName,
+      phoneNumber: phoneNumber ?? '',
+      role: requestedRole ?? UserRole.gymOwner,
+      gymName: 'Partner Gym',
+      createdAt: DateTime.now(),
+      permissions: defaultGymAdminPermissions,
+    );
+
+    try {
+      await firestore.collection('users').doc(uid).set({
+        'id': uid,
+        'email': normalizedEmail,
+        'fullName': gymAdminName,
+        'phoneNumber': phoneNumber ?? '',
+        'role': (requestedRole ?? UserRole.gymOwner).name,
+        'isSuperAdmin': false,
+        'tenantId': null,
+        'gymName': 'Partner Gym',
+        'permissions': defaultGymAdminPermissions,
+        'isActive': true,
+        'createdAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (_) {}
+
+    return fallbackGymAdmin;
+  }
+
   @override
   Future<AuthSession> login({
     required String email,
@@ -595,77 +893,39 @@ class FirebaseAuthService implements AuthRepository {
 
       final uid = fbUser.uid;
       UserModel userModel;
-      const permissions = [
-        'manage_all_tenants',
-        'approve_gym_vendors',
-        'view_global_revenue',
-        'manage_system_settings',
-        'manage_global_trainers',
-        'manage_security_keys',
-      ];
 
       try {
-        final docSnap = await firestore.collection('users').doc(uid).get();
-        if (docSnap.exists && docSnap.data() != null) {
-          final data = docSnap.data()!;
-          data['id'] = uid;
-          userModel = UserModel.fromJson(data);
-        } else {
-          // Document missing in Firestore: Auto-create and persist to Firestore now
-          final displayName = fbUser.displayName ?? 'Platform Super Admin';
-          userModel = UserModel(
-            id: uid,
-            email: normalizedEmail,
-            fullName: displayName,
-            role: requestedRole ?? UserRole.superAdmin,
-            gymName: 'GCRM ONE Global Platform',
-            createdAt: DateTime.now(),
-            permissions: permissions,
-          );
-
-          final userDoc = {
-            'id': uid,
-            'email': normalizedEmail,
-            'fullName': displayName,
-            'phoneNumber': fbUser.phoneNumber ?? '+1 (800) 555-0199',
-            'role': (requestedRole ?? UserRole.superAdmin).name,
-            'isSuperAdmin': true,
-            'tenantId': null,
-            'gymName': 'GCRM ONE Global Platform',
-            'permissions': permissions,
-            'isActive': true,
-            'createdAt': FieldValue.serverTimestamp(),
-            'updatedAt': FieldValue.serverTimestamp(),
-          };
-
-          await firestore.collection('users').doc(uid).set(
-                userDoc,
-                SetOptions(merge: true),
-              );
-
-          try {
-            await firestore.collection('platform_governance').doc('superadmin').set(
-              {
-                'masterAdminUid': uid,
-                'masterAdminEmail': normalizedEmail,
-                'masterAdminName': displayName,
-                'initializedAt': FieldValue.serverTimestamp(),
-                'platformStatus': 'active',
-              },
-              SetOptions(merge: true),
-            );
-          } catch (_) {}
-        }
+        userModel = await _resolveUserAccount(
+          uid: uid,
+          normalizedEmail: normalizedEmail,
+          displayName: fbUser.displayName,
+          phoneNumber: fbUser.phoneNumber,
+          requestedRole: requestedRole,
+        );
       } catch (firestoreError) {
         debugPrint('Firestore user sync notice: $firestoreError');
+        final isMaster = normalizedEmail == AppStrings.demoSuperAdminEmail.toLowerCase() ||
+            requestedRole == UserRole.superAdmin;
         userModel = UserModel(
           id: uid,
           email: normalizedEmail,
-          fullName: fbUser.displayName ?? 'Platform Super Admin',
-          role: requestedRole ?? UserRole.superAdmin,
-          gymName: 'GCRM ONE Global Platform',
+          fullName: fbUser.displayName ?? (isMaster ? 'Platform Super Admin' : 'Gym Admin'),
+          role: isMaster ? UserRole.superAdmin : (requestedRole ?? UserRole.gymOwner),
+          gymName: isMaster ? 'GCRM ONE Global Platform' : 'Partner Gym',
           createdAt: DateTime.now(),
-          permissions: permissions,
+          permissions: isMaster
+              ? const [
+                  'manage_all_tenants',
+                  'approve_gym_vendors',
+                  'view_global_revenue',
+                  'manage_system_settings',
+                ]
+              : const [
+                  'manage_gym_members',
+                  'manage_trainers',
+                  'view_gym_analytics',
+                  'process_memberships',
+                ],
         );
       }
 
@@ -973,65 +1233,39 @@ class FirebaseAuthService implements AuthRepository {
       if (fbUser == null) return null;
 
       final uid = fbUser.uid;
+      final normalizedEmail = (fbUser.email ?? '').trim().toLowerCase();
       UserModel userModel;
 
       try {
-        final docSnap = await firestore.collection('users').doc(uid).get();
-        if (docSnap.exists && docSnap.data() != null) {
-          final data = docSnap.data()!;
-          data['id'] = uid;
-          userModel = UserModel.fromJson(data);
-        } else {
-          final displayName = fbUser.displayName ?? 'Platform Super Admin';
-          const permissions = [
-            'manage_all_tenants',
-            'approve_gym_vendors',
-            'view_global_revenue',
-            'manage_system_settings',
-            'manage_global_trainers',
-            'manage_security_keys',
-          ];
-
-          userModel = UserModel(
-            id: uid,
-            email: fbUser.email ?? '',
-            fullName: displayName,
-            role: UserRole.superAdmin,
-            gymName: 'GCRM ONE Global Platform',
-            createdAt: DateTime.now(),
-            permissions: permissions,
-          );
-
-          await firestore.collection('users').doc(uid).set(
-            {
-              'id': uid,
-              'email': fbUser.email ?? '',
-              'fullName': displayName,
-              'role': UserRole.superAdmin.name,
-              'isSuperAdmin': true,
-              'gymName': 'GCRM ONE Global Platform',
-              'permissions': permissions,
-              'isActive': true,
-              'createdAt': FieldValue.serverTimestamp(),
-              'updatedAt': FieldValue.serverTimestamp(),
-            },
-            SetOptions(merge: true),
-          );
-        }
-      } catch (_) {
+        userModel = await _resolveUserAccount(
+          uid: uid,
+          normalizedEmail: normalizedEmail,
+          displayName: fbUser.displayName,
+          phoneNumber: fbUser.phoneNumber,
+        );
+      } catch (firestoreError) {
+        debugPrint('Firestore session user sync notice: $firestoreError');
+        final isMaster = normalizedEmail == AppStrings.demoSuperAdminEmail.toLowerCase();
         userModel = UserModel(
           id: uid,
-          email: fbUser.email ?? '',
-          fullName: fbUser.displayName ?? 'Platform Super Admin',
-          role: UserRole.superAdmin,
-          gymName: 'GCRM ONE Global Platform',
+          email: normalizedEmail,
+          fullName: fbUser.displayName ?? (isMaster ? 'Platform Super Admin' : 'Gym Admin'),
+          role: isMaster ? UserRole.superAdmin : UserRole.gymOwner,
+          gymName: isMaster ? 'GCRM ONE Global Platform' : 'Partner Gym',
           createdAt: DateTime.now(),
-          permissions: const [
-            'manage_all_tenants',
-            'approve_gym_vendors',
-            'view_global_revenue',
-            'manage_system_settings',
-          ],
+          permissions: isMaster
+              ? const [
+                  'manage_all_tenants',
+                  'approve_gym_vendors',
+                  'view_global_revenue',
+                  'manage_system_settings',
+                ]
+              : const [
+                  'manage_gym_members',
+                  'manage_trainers',
+                  'view_gym_analytics',
+                  'process_memberships',
+                ],
         );
       }
 
@@ -1061,13 +1295,13 @@ class FirebaseAuthService implements AuthRepository {
   @override
   Future<List<GymTenantModel>> getGymTenants() async {
     if (!_isFirebaseReady) {
-      return await _fallbackService.getGymTenants();
+      return [];
     }
 
     try {
       final snap = await firestore.collection('tenants').get();
       if (snap.docs.isEmpty) {
-        return await _fallbackService.getGymTenants();
+        return [];
       }
 
       return snap.docs.map((doc) {
@@ -1076,7 +1310,7 @@ class FirebaseAuthService implements AuthRepository {
         return GymTenantModel.fromJson(data);
       }).toList();
     } catch (_) {
-      return await _fallbackService.getGymTenants();
+      return [];
     }
   }
 
@@ -1121,7 +1355,7 @@ class FirebaseAuthService implements AuthRepository {
   @override
   Future<List<PlatformPlanModel>> getPlatformPlans() async {
     if (!_isFirebaseReady) {
-      return await _fallbackService.getPlatformPlans();
+      return [];
     }
 
     try {
@@ -1942,20 +2176,9 @@ class FirebaseAuthService implements AuthRepository {
           .doc(tenantId)
           .collection('members');
 
-      // Server-side status filter
-      if (statusFilter == 'Active') {
-        query = query.where('isActive', isEqualTo: true);
-      } else if (statusFilter == 'Expiring') {
-        final now = DateTime.now();
-        final sevenDays = now.add(const Duration(days: 7));
-        query = query
-            .where('isActive', isEqualTo: true)
-            .where('expiryDate', isLessThanOrEqualTo: Timestamp.fromDate(sevenDays));
-      } else if (statusFilter == 'Expired') {
-        query = query.where('isActive', isEqualTo: false);
-      }
-
-      query = query.orderBy('createdAt', descending: true);
+      try {
+        query = query.orderBy('createdAt', descending: true);
+      } catch (_) {}
 
       if (lastDocument is DocumentSnapshot) {
         query = query.startAfterDocument(lastDocument);
@@ -1974,10 +2197,20 @@ class FirebaseAuthService implements AuthRepository {
         );
       }
 
-      final members = snapshot.docs.map((doc) {
+      var members = snapshot.docs.map((doc) {
         final data = doc.data();
         return GymMemberModel.fromJson(data, doc.id);
       }).toList();
+
+      if (statusFilter == 'Active') {
+        members = members.where((m) => m.isActive).toList();
+      } else if (statusFilter == 'Inactive') {
+        members = members.where((m) => !m.isActive).toList();
+      } else if (statusFilter == 'Expiring') {
+        members = members.where((m) => m.isActive && m.isExpiringSoon).toList();
+      } else if (statusFilter == 'Expired') {
+        members = members.where((m) => !m.isActive || m.isExpired).toList();
+      }
 
       final lastDoc = snapshot.docs.last;
       final hasMore = snapshot.docs.length >= limit;
@@ -1990,6 +2223,33 @@ class FirebaseAuthService implements AuthRepository {
       );
     } catch (e) {
       debugPrint('Firestore getPaginatedGymMembers error: $e');
+      try {
+        final rawSnap = await firestore
+            .collection('tenants')
+            .doc(tenantId)
+            .collection('members')
+            .limit(limit)
+            .get();
+        if (rawSnap.docs.isNotEmpty) {
+          var members = rawSnap.docs.map((d) => GymMemberModel.fromJson(d.data(), d.id)).toList();
+          if (statusFilter == 'Active') {
+            members = members.where((m) => m.isActive).toList();
+          } else if (statusFilter == 'Inactive') {
+            members = members.where((m) => !m.isActive).toList();
+          } else if (statusFilter == 'Expiring') {
+            members = members.where((m) => m.isActive && m.isExpiringSoon).toList();
+          } else if (statusFilter == 'Expired') {
+            members = members.where((m) => !m.isActive || m.isExpired).toList();
+          }
+          return PaginatedMembersResult(
+            members: members,
+            lastDocument: rawSnap.docs.last,
+            hasMore: rawSnap.docs.length >= limit,
+            totalCount: members.length,
+          );
+        }
+      } catch (_) {}
+
       return await _fallbackService.getPaginatedGymMembers(
         tenantId: tenantId,
         limit: limit,
@@ -2569,6 +2829,208 @@ class FirebaseAuthService implements AuthRepository {
     }
   }
 
+  // ── Gym Media Gallery Production Implementation ──
+  @override
+  Future<List<GymGalleryItemModel>> getGymGalleryItems({
+    required String tenantId,
+  }) async {
+    if (_isFirebaseReady) {
+      try {
+        final querySnapshot = await firestore
+            .collection('tenants')
+            .doc(tenantId)
+            .collection('gallery')
+            .orderBy('createdAt', descending: true)
+            .limit(25)
+            .get();
+
+        if (querySnapshot.docs.isNotEmpty) {
+          return querySnapshot.docs
+              .map((doc) => GymGalleryItemModel.fromJson(doc.data(), doc.id))
+              .toList();
+        }
+      } catch (e) {
+        debugPrint('Firestore getGymGalleryItems error (falling back to local): $e');
+      }
+    }
+    return await _fallbackService.getGymGalleryItems(tenantId: tenantId);
+  }
+
+  @override
+  Future<List<GymGalleryItemModel>> uploadGymGalleryItems({
+    required String tenantId,
+    required List<GymGalleryUploadPayload> items,
+    String uploadedBy = 'Admin',
+  }) async {
+    if (items.isEmpty) return [];
+
+    final currentItems = await getGymGalleryItems(tenantId: tenantId);
+    if (currentItems.length >= 25) {
+      throw Exception('Gallery limit reached. Maximum 25 media items allowed per gym facility.');
+    }
+    if (items.length > 10) {
+      throw Exception('Upload limit exceeded. You can upload up to 10 items at one time.');
+    }
+    if (currentItems.length + items.length > 25) {
+      final available = 25 - currentItems.length;
+      throw Exception('Cannot upload ${items.length} items. Only $available slot(s) remaining in the gallery.');
+    }
+
+    if (_isFirebaseReady) {
+      try {
+        final List<GymGalleryItemModel> results = [];
+        final galleryRef = firestore
+            .collection('tenants')
+            .doc(tenantId)
+            .collection('gallery');
+
+        for (final item in items) {
+          final docId = 'gal_${DateTime.now().millisecondsSinceEpoch}_${results.length}';
+          String mediaUrl = '';
+          String thumbUrl = '';
+          int optimizedSize = 0;
+          int? width;
+          int? height;
+
+          if (item.mediaType == GymGalleryMediaType.video) {
+            try {
+              final videoStorageRef = storage.ref('tenants/$tenantId/gallery/$docId.mp4');
+              final uploadTask = await videoStorageRef.putData(
+                item.bytes,
+                SettableMetadata(contentType: 'video/mp4'),
+              );
+              mediaUrl = await uploadTask.ref.getDownloadURL();
+            } catch (storageErr) {
+              debugPrint('Storage video upload error (fallback to data URI): $storageErr');
+              mediaUrl = '';
+            }
+            final coverBytes = item.customThumbnailBytes;
+            if (coverBytes != null && coverBytes.isNotEmpty) {
+              try {
+                final thumbStorageRef = storage.ref('tenants/$tenantId/gallery/${docId}_thumb.jpg');
+                final thumbTask = await thumbStorageRef.putData(
+                  coverBytes,
+                  SettableMetadata(contentType: 'image/jpeg'),
+                );
+                thumbUrl = await thumbTask.ref.getDownloadURL();
+              } catch (thumbErr) {
+                debugPrint('Storage video thumbnail upload error: $thumbErr');
+                thumbUrl = 'data:image/jpeg;base64,${base64Encode(coverBytes)}';
+              }
+            }
+            optimizedSize = item.bytes.lengthInBytes;
+            width = item.width;
+            height = item.height;
+          } else {
+            // Image optimization
+            final optResult = await ImageOptimizer.optimizeGalleryImage(
+              item.bytes,
+              maxDimension: 1440,
+              quality: 82,
+            );
+            final thumbResult = await ImageOptimizer.optimizeImage(
+              optResult.bytes,
+              maxDimension: 400,
+              quality: 75,
+            );
+            optimizedSize = optResult.optimizedSizeBytes;
+            width = optResult.width;
+            height = optResult.height;
+
+            try {
+              final imgStorageRef = storage.ref('tenants/$tenantId/gallery/$docId.jpg');
+              final uploadTask = await imgStorageRef.putData(
+                optResult.bytes,
+                SettableMetadata(contentType: 'image/jpeg'),
+              );
+              mediaUrl = await uploadTask.ref.getDownloadURL();
+
+              final thumbStorageRef = storage.ref('tenants/$tenantId/gallery/${docId}_thumb.jpg');
+              final thumbTask = await thumbStorageRef.putData(
+                thumbResult.bytes,
+                SettableMetadata(contentType: 'image/jpeg'),
+              );
+              thumbUrl = await thumbTask.ref.getDownloadURL();
+            } catch (storageErr) {
+              debugPrint('Storage image upload error (fallback to data URI): $storageErr');
+              mediaUrl = optResult.base64DataUri;
+              thumbUrl = thumbResult.base64DataUri;
+            }
+          }
+
+          final galleryItem = GymGalleryItemModel(
+            id: docId,
+            tenantId: tenantId,
+            title: item.title.isNotEmpty ? item.title : item.fileName,
+            mediaType: item.mediaType,
+            mediaUrl: mediaUrl,
+            thumbnailUrl: item.mediaType == GymGalleryMediaType.video
+                ? thumbUrl
+                : (thumbUrl.isNotEmpty ? thumbUrl : mediaUrl),
+            originalSizeBytes: item.originalSizeBytes > 0 ? item.originalSizeBytes : item.bytes.lengthInBytes,
+            optimizedSizeBytes: optimizedSize,
+            width: width,
+            height: height,
+            durationSeconds: item.durationSeconds,
+            createdAt: DateTime.now(),
+            uploadedBy: uploadedBy,
+          );
+
+          await galleryRef.doc(docId).set(galleryItem.toJson());
+          results.add(galleryItem);
+        }
+
+        try {
+          await _fallbackService.uploadGymGalleryItems(
+            tenantId: tenantId,
+            items: items,
+            uploadedBy: uploadedBy,
+          );
+        } catch (_) {}
+
+        return results;
+      } catch (e) {
+        debugPrint('Firestore uploadGymGalleryItems error (falling back to mock): $e');
+      }
+    }
+
+    return await _fallbackService.uploadGymGalleryItems(
+      tenantId: tenantId,
+      items: items,
+      uploadedBy: uploadedBy,
+    );
+  }
+
+  @override
+  Future<void> deleteGymGalleryItem({
+    required String tenantId,
+    required String itemId,
+  }) async {
+    await _fallbackService.deleteGymGalleryItem(
+      tenantId: tenantId,
+      itemId: itemId,
+    );
+
+    if (_isFirebaseReady) {
+      try {
+        final docRef = firestore
+            .collection('tenants')
+            .doc(tenantId)
+            .collection('gallery')
+            .doc(itemId);
+        await docRef.delete();
+
+        try {
+          await storage.ref('tenants/$tenantId/gallery/$itemId.jpg').delete();
+          await storage.ref('tenants/$tenantId/gallery/$itemId.mp4').delete();
+          await storage.ref('tenants/$tenantId/gallery/${itemId}_thumb.jpg').delete();
+        } catch (_) {}
+      } catch (e) {
+        debugPrint('Firestore deleteGymGalleryItem error: $e');
+      }
+    }
+  }
+
   Exception _handleAuthException(FirebaseAuthException e) {
     switch (e.code) {
       case 'weak-password':
@@ -2586,6 +3048,208 @@ class FirebaseAuthService implements AuthRepository {
         return Exception('The email address provided is invalid.');
       default:
         return Exception(e.message ?? 'Authentication error occurred (${e.code}).');
+    }
+  }
+
+  @override
+  Future<PushNotificationRecord> sendSuperAdminPushNotification({
+    required String title,
+    required String body,
+    required String targetAudience,
+    String? targetTenantId,
+    String? targetGymName,
+    String sound = 'notification.mp3',
+    String? sentByName,
+  }) async {
+    if (!_isFirebaseReady) {
+      return _fallbackService.sendSuperAdminPushNotification(
+        title: title,
+        body: body,
+        targetAudience: targetAudience,
+        targetTenantId: targetTenantId,
+        targetGymName: targetGymName,
+        sound: sound,
+        sentByName: sentByName,
+      );
+    }
+
+    try {
+      final docRef = firestore.collection('notifications_queue').doc();
+      final now = DateTime.now();
+      final inboxEntry = <String, dynamic>{
+        'id': docRef.id,
+        'title': title,
+        'body': body,
+        'createdAt': now.toIso8601String(),
+        'targetAudience': targetAudience,
+        'targetTenantId': targetTenantId ?? '',
+        'sound': sound,
+      };
+
+      var recipientIds = <String>[];
+      try {
+        recipientIds = await _collectBroadcastRecipientIds(
+          targetAudience: targetAudience,
+          targetTenantId: targetTenantId,
+        );
+        await _fanOutInboxEntries(recipientIds, inboxEntry);
+      } catch (fanOutError) {
+        debugPrint('Notice: Error delivering notification inbox copies: $fanOutError');
+      }
+
+      final data = <String, dynamic>{
+        'id': docRef.id,
+        'title': title,
+        'body': body,
+        'targetAudience': targetAudience,
+        'targetTenantId': targetTenantId,
+        'targetGymName': targetGymName,
+        'sound': sound,
+        'inboxEntry': inboxEntry,
+        'status': 'pending',
+        'recipientsCount': recipientIds.length,
+        'successCount': 0,
+        'failureCount': 0,
+        'createdAt': FieldValue.serverTimestamp(),
+        'sentBy': auth.currentUser?.uid ?? 'superadmin',
+        'sentByName': sentByName ?? 'Super Admin',
+      };
+
+      await docRef.set(data);
+
+      return PushNotificationRecord(
+        id: docRef.id,
+        title: title,
+        body: body,
+        targetAudience: targetAudience,
+        targetTenantId: targetTenantId,
+        targetGymName: targetGymName,
+        sound: sound,
+        status: 'pending',
+        recipientsCount: recipientIds.length,
+        createdAt: now,
+        sentByName: sentByName ?? 'Super Admin',
+      );
+    } catch (e) {
+      debugPrint('Firestore sendSuperAdminPushNotification error: $e');
+      return _fallbackService.sendSuperAdminPushNotification(
+        title: title,
+        body: body,
+        targetAudience: targetAudience,
+        targetTenantId: targetTenantId,
+        targetGymName: targetGymName,
+        sound: sound,
+        sentByName: sentByName,
+      );
+    }
+  }
+
+  /// User ids that should receive this broadcast in their notification inbox.
+  Future<List<String>> _collectBroadcastRecipientIds({
+    required String targetAudience,
+    String? targetTenantId,
+  }) async {
+    final ids = <String>{};
+
+    void addDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+      if (doc.id.trim().isNotEmpty) ids.add(doc.id);
+    }
+
+    if (targetAudience == 'specific_gym' && targetTenantId != null && targetTenantId.isNotEmpty) {
+      final usersSnap = await firestore
+          .collection('users')
+          .where('tenantId', isEqualTo: targetTenantId)
+          .get();
+      for (final doc in usersSnap.docs) {
+        addDoc(doc);
+      }
+      try {
+        final tenantDoc = await firestore.collection('tenants').doc(targetTenantId).get();
+        final tData = tenantDoc.data();
+        for (final key in ['adminId', 'ownerId']) {
+          final uid = tData?[key]?.toString().trim() ?? '';
+          if (uid.isNotEmpty) ids.add(uid);
+        }
+      } catch (e) {
+        debugPrint('Notice: Unable to resolve gym admin ids for $targetTenantId: $e');
+      }
+      return ids.toList();
+    }
+
+    Query<Map<String, dynamic>> usersQuery = firestore.collection('users');
+    if (targetAudience == 'gym_owners') {
+      usersQuery = usersQuery.where('role', whereIn: [
+        'gymOwner',
+        'gym_owner',
+        'gym_admin',
+        'owner',
+        'admin',
+        'gymAdmin',
+      ]);
+    }
+    final usersSnap = await usersQuery.get();
+    for (final doc in usersSnap.docs) {
+      addDoc(doc);
+    }
+
+    if (targetAudience == 'gym_owners') {
+      try {
+        final tenantsSnap = await firestore.collection('tenants').get();
+        for (final tenant in tenantsSnap.docs) {
+          final data = tenant.data();
+          for (final key in ['adminId', 'ownerId']) {
+            final uid = data[key]?.toString().trim() ?? '';
+            if (uid.isNotEmpty) ids.add(uid);
+          }
+        }
+      } catch (e) {
+        debugPrint('Notice: Unable to resolve gym owner ids from tenants: $e');
+      }
+    }
+
+    return ids.toList();
+  }
+
+  /// Writes a copy onto each recipient so the gym admin notification page can list it.
+  Future<void> _fanOutInboxEntries(List<String> userIds, Map<String, dynamic> entry) async {
+    const chunkSize = 400;
+    for (var i = 0; i < userIds.length; i += chunkSize) {
+      final end = (i + chunkSize < userIds.length) ? i + chunkSize : userIds.length;
+      final batch = firestore.batch();
+      for (final uid in userIds.sublist(i, end)) {
+        batch.set(
+          firestore.collection('users').doc(uid),
+          {'platformNotifications': FieldValue.arrayUnion([entry])},
+          SetOptions(merge: true),
+        );
+      }
+      await batch.commit();
+    }
+  }
+
+  @override
+  Future<List<PushNotificationRecord>> getSentNotificationsHistory({int limit = 50}) async {
+    if (!_isFirebaseReady) {
+      return _fallbackService.getSentNotificationsHistory(limit: limit);
+    }
+
+    try {
+      final snap = await firestore
+          .collection('notifications_queue')
+          .orderBy('createdAt', descending: true)
+          .limit(limit)
+          .get();
+
+      if (snap.docs.isEmpty) {
+        return _fallbackService.getSentNotificationsHistory(limit: limit);
+      }
+
+      return snap.docs
+          .map((doc) => PushNotificationRecord.fromMap(doc.data(), docId: doc.id))
+          .toList();
+    } catch (e) {
+      debugPrint('Firestore getSentNotificationsHistory error: $e');
+      return _fallbackService.getSentNotificationsHistory(limit: limit);
     }
   }
 }

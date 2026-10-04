@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'core/services/notification_service.dart';
 import 'firebase_options.dart';
 import 'core/constants/app_strings.dart';
 import 'core/theme/app_theme.dart';
@@ -25,13 +27,15 @@ void main() async {
     ),
   );
 
-  // Initialize Firebase for iOS
+  // Initialize Firebase and Push Notification Service
   try {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
     );
+    FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
+    await NotificationService.initialize();
   } catch (e) {
-    debugPrint('Firebase initialization notice: $e');
+    debugPrint('Firebase/Notification initialization notice: $e');
   }
 
   final authRepository = FirebaseAuthService();

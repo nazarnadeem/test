@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter/widgets.dart';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
+import '../widgets/gradient_linear_loader.dart';
 
 /// Optimization Result holding the compressed image bytes, metadata, and savings statistics
 class ImageOptimizationResult {
@@ -66,6 +68,10 @@ typedef OptimizedImageResult = ImageOptimizationResult;
 
 /// High-efficiency client-side image optimization and compression utility
 class ImageOptimizer {
+  /// Converts raw bytes to base64 Data URI string
+  static String toDataUri(Uint8List bytes, {String mime = 'image/jpeg'}) =>
+      'data:$mime;base64,${base64Encode(bytes)}';
+
   /// Compresses and resizes raw image bytes before upload or storage
   static Future<ImageOptimizationResult> optimizeImage(
     Uint8List rawBytes, {
@@ -144,11 +150,39 @@ class ImageOptimizer {
     return Uint8List.fromList(img.encodeJpg(image, quality: 85));
   }
 
-  /// Safely renders an image widget whether the source is a http(s) URL, a base64 data URI, or null
+  /// Generate sample video thumbnail bytes for simulation and testing
+  static Uint8List createVideoThumbnailBytes({int width = 480, int height = 320}) {
+    final image = img.Image(width: width, height: height);
+    img.fill(image, color: img.ColorRgba8(24, 30, 42, 255));
+    return Uint8List.fromList(img.encodeJpg(image, quality: 80));
+  }
+
+
+  /// Optimizes a gallery image: downscales to maxDimension and compresses to JPEG
+  static Future<ImageOptimizationResult> optimizeGalleryImage(
+    Uint8List rawBytes, {
+    int maxDimension = 1440,
+    int quality = 82,
+  }) async {
+    return optimizeImage(
+      rawBytes,
+      maxDimension: maxDimension,
+      quality: quality,
+      format: 'jpg',
+    );
+  }
+
+  /// Safely renders an image widget whether the source is a http(s) URL, a base64 data URI, or null.
+  /// Automatically caches network images via [CachedNetworkImage] and displays a sleek
+  /// linear loader with a primary-color gradient while the image is loading.
   static Widget buildImageWidget(
     String? source, {
     BoxFit fit = BoxFit.cover,
     Widget? placeholder,
+    Widget? loadingWidget,
+    Color? primaryColor,
+    double? width,
+    double? height,
     Widget Function(BuildContext, Object, StackTrace?)? errorBuilder,
   }) {
     if (source == null || source.isEmpty) {
@@ -161,6 +195,8 @@ class ImageOptimizer {
         final decodedBytes = base64Decode(base64Payload);
         return Image.memory(
           decodedBytes,
+          width: width,
+          height: height,
           fit: fit,
           errorBuilder: errorBuilder ?? (_, __, ___) => placeholder ?? const SizedBox.shrink(),
         );
@@ -168,10 +204,42 @@ class ImageOptimizer {
         return placeholder ?? const SizedBox.shrink();
       }
     }
-    return Image.network(
-      source,
+
+    return CachedNetworkImage(
+      imageUrl: source,
+      width: width,
+      height: height,
       fit: fit,
-      errorBuilder: errorBuilder ?? (_, __, ___) => placeholder ?? const SizedBox.shrink(),
+      progressIndicatorBuilder: (context, url, downloadProgress) {
+        if (loadingWidget != null) return loadingWidget;
+        return GradientLinearLoader(
+          progress: downloadProgress.progress,
+          primaryColor: primaryColor,
+        );
+      },
+      errorWidget: (context, url, error) {
+        if (errorBuilder != null) {
+          return errorBuilder(context, error, null);
+        }
+        return placeholder ?? const SizedBox.shrink();
+      },
     );
   }
+
+  /// Returns a cached network image provider or fallback memory provider
+  static ImageProvider? buildImageProvider(String? source) {
+    if (source == null || source.isEmpty) return null;
+    if (source.startsWith('data:image')) {
+      try {
+        final commaIdx = source.indexOf(',');
+        final base64Payload = commaIdx != -1 ? source.substring(commaIdx + 1) : source;
+        return MemoryImage(base64Decode(base64Payload));
+      } catch (_) {
+        return null;
+      }
+    }
+    return CachedNetworkImageProvider(source);
+  }
 }
+
+

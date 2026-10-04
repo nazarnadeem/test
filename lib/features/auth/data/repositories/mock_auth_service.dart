@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import '../../../../core/utils/image_optimizer.dart';
 import '../models/user_model.dart';
@@ -11,6 +12,8 @@ import '../models/gym_member_model.dart';
 import '../models/gym_expense_model.dart';
 import '../models/gym_check_in_model.dart';
 import '../models/gym_batch_model.dart';
+import '../models/gym_gallery_item_model.dart';
+import '../models/push_notification_model.dart';
 import 'auth_repository.dart';
 
 /// In-memory mock authentication implementation for GCRM One.
@@ -32,6 +35,7 @@ class MockAuthService implements AuthRepository {
     _expensesByTenant.clear();
     _checkInsByTenant.clear();
     _batchesByTenant.clear();
+    _galleryByTenant.clear();
     _currentSession = null;
     _seedInitialData();
   }
@@ -45,6 +49,8 @@ class MockAuthService implements AuthRepository {
   final Map<String, List<GymExpenseRecord>> _expensesByTenant = {};
   final Map<String, List<GymCheckInLog>> _checkInsByTenant = {};
   final Map<String, List<GymBatchModel>> _batchesByTenant = {};
+  final Map<String, List<GymGalleryItemModel>> _galleryByTenant = {};
+  final List<PushNotificationRecord> _sentNotifications = [];
   AuthSession? _currentSession;
 
   void _seedInitialData() {
@@ -192,6 +198,53 @@ class MockAuthService implements AuthRepository {
       user: memberUser,
       password: 'Member@Metro2026',
     );
+
+    // 7. Seed Gym Gallery Media for Metro Fitness
+    final sampleImgBytes1 = ImageOptimizer.createSampleAvatarBytes(size: 380, colorValue: 0xFFFF5722);
+    final sampleImgBytes2 = ImageOptimizer.createSampleAvatarBytes(size: 380, colorValue: 0xFF00E5FF);
+    _galleryByTenant['tenant_metro_01'] = [
+      GymGalleryItemModel(
+        id: 'gal_seed_01',
+        tenantId: 'tenant_metro_01',
+        title: 'Olympic Weightlifting Deck',
+        mediaType: GymGalleryMediaType.image,
+        mediaUrl: 'data:image/jpeg;base64,${base64Encode(sampleImgBytes1)}',
+        thumbnailUrl: 'data:image/jpeg;base64,${base64Encode(sampleImgBytes1)}',
+        originalSizeBytes: 1850000,
+        optimizedSizeBytes: 142000,
+        width: 1440,
+        height: 960,
+        createdAt: DateTime.now().subtract(const Duration(days: 3)),
+        uploadedBy: 'Nazar Admin',
+      ),
+      GymGalleryItemModel(
+        id: 'gal_seed_02',
+        tenantId: 'tenant_metro_01',
+        title: 'Cardio & Endurance Zone',
+        mediaType: GymGalleryMediaType.image,
+        mediaUrl: 'data:image/jpeg;base64,${base64Encode(sampleImgBytes2)}',
+        thumbnailUrl: 'data:image/jpeg;base64,${base64Encode(sampleImgBytes2)}',
+        originalSizeBytes: 2400000,
+        optimizedSizeBytes: 188000,
+        width: 1440,
+        height: 960,
+        createdAt: DateTime.now().subtract(const Duration(days: 2)),
+        uploadedBy: 'Nazar Admin',
+      ),
+      GymGalleryItemModel(
+        id: 'gal_seed_03',
+        tenantId: 'tenant_metro_01',
+        title: 'Functional CrossFit Workout Reel',
+        mediaType: GymGalleryMediaType.video,
+        mediaUrl: 'https://sample-videos.com/video321/mp4/720/big_buck_bunny_720p_1mb.mp4',
+        thumbnailUrl: '',
+        originalSizeBytes: 14200000,
+        optimizedSizeBytes: 3800000,
+        durationSeconds: 45,
+        createdAt: DateTime.now().subtract(const Duration(days: 1)),
+        uploadedBy: 'Nazar Admin',
+      ),
+    ];
   }
 
   @override
@@ -960,12 +1013,12 @@ class MockAuthService implements AuthRepository {
     final filtered = all.where((m) {
       if (statusFilter == 'Active') {
         return m.isActive;
+      } else if (statusFilter == 'Inactive') {
+        return !m.isActive;
       } else if (statusFilter == 'Expiring') {
-        final now = DateTime.now();
-        final daysUntilExpiry = m.expiryDate.difference(now).inDays;
-        return m.isActive && daysUntilExpiry <= 7;
+        return m.isActive && m.isExpiringSoon;
       } else if (statusFilter == 'Expired') {
-        return !m.isActive || m.expiryDate.isBefore(DateTime.now());
+        return !m.isActive || m.isExpired;
       }
       return true;
     }).toList();
@@ -1204,6 +1257,189 @@ class MockAuthService implements AuthRepository {
     if (_expensesByTenant.containsKey(tenantId)) {
       _expensesByTenant[tenantId]!.removeWhere((e) => e.id == expenseId);
     }
+  }
+
+  // ── Gym Media Gallery Mock Methods ──
+  @override
+  Future<List<GymGalleryItemModel>> getGymGalleryItems({
+    required String tenantId,
+  }) async {
+    if (!_galleryByTenant.containsKey(tenantId)) {
+      _galleryByTenant[tenantId] = [];
+    }
+    final all = _galleryByTenant[tenantId]!;
+    return List.unmodifiable(all.take(25));
+  }
+
+  @override
+  Future<List<GymGalleryItemModel>> uploadGymGalleryItems({
+    required String tenantId,
+    required List<GymGalleryUploadPayload> items,
+    String uploadedBy = 'Admin',
+  }) async {
+    if (!_galleryByTenant.containsKey(tenantId)) {
+      _galleryByTenant[tenantId] = [];
+    }
+    final existing = _galleryByTenant[tenantId]!;
+    if (existing.length >= 25) {
+      throw Exception('Gallery limit reached. Maximum 25 media items allowed per gym facility.');
+    }
+    if (items.length > 10) {
+      throw Exception('Upload limit exceeded. You can upload up to 10 items at one time.');
+    }
+    if (existing.length + items.length > 25) {
+      final available = 25 - existing.length;
+      throw Exception('Cannot upload ${items.length} items. Only $available slot(s) remaining in the gallery.');
+    }
+
+    final List<GymGalleryItemModel> uploaded = [];
+
+    for (final item in items) {
+      final itemId = 'gal_${DateTime.now().millisecondsSinceEpoch}_${uploaded.length}';
+
+      if (item.mediaType == GymGalleryMediaType.video) {
+        final cover = item.customThumbnailBytes;
+        final model = GymGalleryItemModel(
+          id: itemId,
+          tenantId: tenantId,
+          title: item.title.isNotEmpty ? item.title : item.fileName,
+          mediaType: GymGalleryMediaType.video,
+          mediaUrl: 'data:video/mp4;base64,${base64Encode(item.bytes)}',
+          thumbnailUrl: cover != null && cover.isNotEmpty
+              ? 'data:image/jpeg;base64,${base64Encode(cover)}'
+              : '',
+          originalSizeBytes: item.originalSizeBytes > 0 ? item.originalSizeBytes : item.bytes.lengthInBytes,
+          optimizedSizeBytes: item.bytes.lengthInBytes,
+          width: item.width,
+          height: item.height,
+          durationSeconds: item.durationSeconds,
+          createdAt: DateTime.now(),
+          uploadedBy: uploadedBy,
+        );
+        uploaded.add(model);
+      } else {
+        // Image optimization
+        final optResult = await ImageOptimizer.optimizeGalleryImage(
+          item.bytes,
+          maxDimension: 1440,
+          quality: 82,
+        );
+        final thumbResult = await ImageOptimizer.optimizeImage(
+          optResult.bytes,
+          maxDimension: 400,
+          quality: 75,
+        );
+
+        final model = GymGalleryItemModel(
+          id: itemId,
+          tenantId: tenantId,
+          title: item.title.isNotEmpty ? item.title : item.fileName,
+          mediaType: GymGalleryMediaType.image,
+          mediaUrl: optResult.base64DataUri,
+          thumbnailUrl: thumbResult.base64DataUri,
+          originalSizeBytes: item.originalSizeBytes > 0 ? item.originalSizeBytes : item.bytes.lengthInBytes,
+          optimizedSizeBytes: optResult.optimizedSizeBytes,
+          width: optResult.width,
+          height: optResult.height,
+          createdAt: DateTime.now(),
+          uploadedBy: uploadedBy,
+        );
+        uploaded.add(model);
+      }
+    }
+
+    existing.insertAll(0, uploaded);
+    if (existing.length > 25) {
+      existing.removeRange(25, existing.length);
+    }
+    return uploaded;
+  }
+
+  @override
+  Future<void> deleteGymGalleryItem({
+    required String tenantId,
+    required String itemId,
+  }) async {
+    if (_galleryByTenant.containsKey(tenantId)) {
+      _galleryByTenant[tenantId]!.removeWhere((e) => e.id == itemId);
+    }
+  }
+
+  @override
+  Future<PushNotificationRecord> sendSuperAdminPushNotification({
+    required String title,
+    required String body,
+    required String targetAudience,
+    String? targetTenantId,
+    String? targetGymName,
+    String sound = 'notification.mp3',
+    String? sentByName,
+  }) async {
+    await Future.delayed(const Duration(milliseconds: 300));
+    int estimatedRecipients = 120;
+    if (targetAudience == 'specific_gym') {
+      estimatedRecipients = 12;
+    } else if (targetAudience == 'gym_owners') {
+      estimatedRecipients = _tenantsById.length;
+    }
+
+    final record = PushNotificationRecord(
+      id: 'notif_${DateTime.now().millisecondsSinceEpoch}',
+      title: title,
+      body: body,
+      targetAudience: targetAudience,
+      targetTenantId: targetTenantId,
+      targetGymName: targetGymName,
+      sound: sound,
+      status: 'completed',
+      recipientsCount: estimatedRecipients,
+      successCount: estimatedRecipients,
+      failureCount: 0,
+      createdAt: DateTime.now(),
+      completedAt: DateTime.now(),
+      sentByName: sentByName ?? 'Super Admin',
+    );
+
+    _sentNotifications.insert(0, record);
+    return record;
+  }
+
+  @override
+  Future<List<PushNotificationRecord>> getSentNotificationsHistory({int limit = 50}) async {
+    await Future.delayed(const Duration(milliseconds: 150));
+    if (_sentNotifications.isEmpty) {
+      _sentNotifications.addAll([
+        PushNotificationRecord(
+          id: 'notif_seed_01',
+          title: '⚡ Scheduled Platform Upgrade',
+          body: 'GCRM One cloud engine will undergo scheduled optimization tonight at 2:00 AM IST.',
+          targetAudience: 'all',
+          sound: 'notification.mp3',
+          status: 'completed',
+          recipientsCount: 84,
+          successCount: 84,
+          failureCount: 0,
+          createdAt: DateTime.now().subtract(const Duration(days: 2)),
+          completedAt: DateTime.now().subtract(const Duration(days: 2)),
+          sentByName: 'Chief Administrator (GCRM ONE)',
+        ),
+        PushNotificationRecord(
+          id: 'notif_seed_02',
+          title: '🎉 New Feature: Batch Scheduling & Scanner',
+          body: 'Real-time QR Check-In and Batch Capacity allocation features are now live for all gyms.',
+          targetAudience: 'gym_owners',
+          sound: 'notification.mp3',
+          status: 'completed',
+          recipientsCount: 18,
+          successCount: 18,
+          failureCount: 0,
+          createdAt: DateTime.now().subtract(const Duration(days: 5)),
+          completedAt: DateTime.now().subtract(const Duration(days: 5)),
+          sentByName: 'Chief Administrator (GCRM ONE)',
+        ),
+      ]);
+    }
+    return List.unmodifiable(_sentNotifications.take(limit));
   }
 }
 

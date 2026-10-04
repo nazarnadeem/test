@@ -12,6 +12,7 @@ import '../../../../core/widgets/gcrm_logo_widget.dart';
 import '../../controllers/auth_controller.dart';
 import '../../data/models/gym_tenant_model.dart';
 import '../../data/models/platform_plan_model.dart';
+import '../../data/models/push_notification_model.dart';
 import 'login_screen.dart';
 
 /// Flagship Super Admin Dashboard Screen for GCRM One Platform Lead.
@@ -40,6 +41,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       widget.authController.loadGymTenants();
       widget.authController.loadPlatformPlans();
+      widget.authController.loadNotificationsHistory();
     });
   }
 
@@ -109,6 +111,570 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     );
   }
 
+  void _showSendNotificationDialog({GymTenantModel? preselectedTenant}) {
+    final titleCtrl = TextEditingController(
+      text: preselectedTenant != null ? '📢 Update for ${preselectedTenant.gymName}' : '',
+    );
+    final bodyCtrl = TextEditingController();
+    final formKey = GlobalKey<FormState>();
+
+    String targetAudience = preselectedTenant != null ? 'specific_gym' : 'all';
+    GymTenantModel? selectedTenant = preselectedTenant ??
+        (widget.authController.gymTenants.isNotEmpty ? widget.authController.gymTenants.first : null);
+    bool isSubmitting = false;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (dialogCtx, setModalState) {
+            return Container(
+              margin: EdgeInsets.only(
+                top: 40,
+                bottom: MediaQuery.of(dialogCtx).viewInsets.bottom,
+              ),
+              decoration: const BoxDecoration(
+                color: Color(0xFF131822),
+                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                border: Border(
+                  top: BorderSide(color: Color(0xFF222B3C), width: 1.5),
+                  left: BorderSide(color: Color(0xFF222B3C), width: 1.5),
+                  right: BorderSide(color: Color(0xFF222B3C), width: 1.5),
+                ),
+              ),
+              child: Form(
+                key: formKey,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      margin: const EdgeInsets.only(top: 12),
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF2E3D52),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: AppColors.primary.withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: const Icon(
+                              Icons.campaign_rounded,
+                              color: AppColors.primary,
+                              size: 22,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Send Push Notification',
+                                  style: GoogleFonts.poppins(
+                                    fontSize: 17,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                Text(
+                                  'Instant mobile broadcast with custom alert sound',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 12,
+                                    color: AppColors.textSecondaryDark,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close_rounded, color: Colors.white70),
+                            onPressed: () => Navigator.pop(ctx),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(color: Color(0xFF222B3C), height: 1),
+                    Flexible(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(20),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'TARGET AUDIENCE',
+                              style: GoogleFonts.poppins(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.primary,
+                                letterSpacing: 1.0,
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            Row(
+                              children: [
+                                _buildAudienceChip(
+                                  label: 'All Users',
+                                  icon: Icons.public_rounded,
+                                  isSelected: targetAudience == 'all',
+                                  onTap: () => setModalState(() => targetAudience = 'all'),
+                                ),
+                                const SizedBox(width: 8),
+                                _buildAudienceChip(
+                                  label: 'Gym Admins',
+                                  icon: Icons.shield_rounded,
+                                  isSelected: targetAudience == 'gym_owners',
+                                  onTap: () => setModalState(() => targetAudience = 'gym_owners'),
+                                ),
+                                const SizedBox(width: 8),
+                                _buildAudienceChip(
+                                  label: 'Specific Gym',
+                                  icon: Icons.fitness_center_rounded,
+                                  isSelected: targetAudience == 'specific_gym',
+                                  onTap: () => setModalState(() => targetAudience = 'specific_gym'),
+                                ),
+                              ],
+                            ),
+                            if (targetAudience == 'specific_gym') ...[
+                              const SizedBox(height: 12),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF0F141E),
+                                  borderRadius: BorderRadius.circular(12),
+                                  border: Border.all(color: const Color(0xFF222B3C)),
+                                ),
+                                child: DropdownButtonHideUnderline(
+                                  child: DropdownButton<GymTenantModel>(
+                                    value: selectedTenant,
+                                    isExpanded: true,
+                                    dropdownColor: const Color(0xFF131822),
+                                    icon: const Icon(Icons.arrow_drop_down_rounded, color: AppColors.primary),
+                                    items: widget.authController.gymTenants.map((t) {
+                                      return DropdownMenuItem<GymTenantModel>(
+                                        value: t,
+                                        child: Text(
+                                          '${t.gymName} (${t.ownerEmail})',
+                                          style: GoogleFonts.inter(fontSize: 13, color: Colors.white),
+                                        ),
+                                      );
+                                    }).toList(),
+                                    onChanged: (newTenant) {
+                                      setModalState(() => selectedTenant = newTenant);
+                                    },
+                                  ),
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 18),
+                            Text(
+                              'QUICK TEMPLATES',
+                              style: GoogleFonts.poppins(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textSecondaryDark,
+                                letterSpacing: 0.8,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Row(
+                                children: [
+                                  _buildTemplateChip(
+                                    label: '⚡ Maintenance',
+                                    onTap: () {
+                                      setModalState(() {
+                                        titleCtrl.text = '⚡ Scheduled Maintenance';
+                                        bodyCtrl.text = 'GCRM One cloud services will undergo scheduled optimization tonight. No disruptions expected.';
+                                      });
+                                    },
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _buildTemplateChip(
+                                    label: '🎉 New Features',
+                                    onTap: () {
+                                      setModalState(() {
+                                        titleCtrl.text = '🎉 New Platform Features Live';
+                                        bodyCtrl.text = 'Exciting updates including mobile QR check-in and batch scheduling are now active on your gym console!';
+                                      });
+                                    },
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _buildTemplateChip(
+                                    label: '📢 Platform Notice',
+                                    onTap: () {
+                                      setModalState(() {
+                                        titleCtrl.text = '📢 Platform Security Notice';
+                                        bodyCtrl.text = 'Please verify your active team credentials and update operating member batches for the new month.';
+                                      });
+                                    },
+                                  ),
+                                  const SizedBox(width: 8),
+                                  _buildTemplateChip(
+                                    label: '💳 Renewal Alert',
+                                    onTap: () {
+                                      setModalState(() {
+                                        titleCtrl.text = '💳 Subscription Plan Renewal';
+                                        bodyCtrl.text = 'Your facility plan is approaching its expiry date. Please review subscription details to maintain uninterrupted access.';
+                                      });
+                                    },
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 18),
+                            Text(
+                              'NOTIFICATION TITLE',
+                              style: GoogleFonts.poppins(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.primary,
+                                letterSpacing: 1.0,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextFormField(
+                              controller: titleCtrl,
+                              style: GoogleFonts.inter(color: Colors.white, fontSize: 14),
+                              decoration: InputDecoration(
+                                hintText: 'e.g., Scheduled Maintenance Notice',
+                                hintStyle: GoogleFonts.inter(color: AppColors.textSecondaryDark, fontSize: 13),
+                                filled: true,
+                                fillColor: const Color(0xFF0F141E),
+                                prefixIcon: const Icon(Icons.title_rounded, color: AppColors.primary, size: 20),
+                                enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: const BorderSide(color: Color(0xFF222B3C)),
+                                ),
+                                focusedBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: const BorderSide(color: AppColors.primary, width: 1.5),
+                                ),
+                              ),
+                              validator: (v) => (v == null || v.trim().isEmpty) ? 'Please enter a notification title' : null,
+                              onChanged: (_) => setModalState(() {}),
+                            ),
+                            const SizedBox(height: 16),
+                            Text(
+                              'MESSAGE BODY',
+                              style: GoogleFonts.poppins(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.primary,
+                                letterSpacing: 1.0,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            TextFormField(
+                              controller: bodyCtrl,
+                              maxLines: 3,
+                              maxLength: 250,
+                              style: GoogleFonts.inter(color: Colors.white, fontSize: 13),
+                              decoration: InputDecoration(
+                                hintText: 'Enter your message to platform users or gym admins...',
+                                hintStyle: GoogleFonts.inter(color: AppColors.textSecondaryDark, fontSize: 13),
+                                filled: true,
+                                fillColor: const Color(0xFF0F141E),
+                                enabledBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: const BorderSide(color: Color(0xFF222B3C)),
+                                ),
+                                focusedBorder: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                  borderSide: const BorderSide(color: AppColors.primary, width: 1.5),
+                                ),
+                              ),
+                              validator: (v) => (v == null || v.trim().isEmpty) ? 'Please enter a notification message' : null,
+                              onChanged: (_) => setModalState(() {}),
+                            ),
+                            const SizedBox(height: 12),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF161F2E),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: AppColors.primary.withValues(alpha: 0.35)),
+                              ),
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.music_note_rounded, size: 20, color: AppColors.primary),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          'Custom Alert Sound Active',
+                                          style: GoogleFonts.poppins(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                        Text(
+                                          'Plays notification.mp3 on Android & iOS devices',
+                                          style: GoogleFonts.inter(
+                                            fontSize: 11,
+                                            color: AppColors.textSecondaryDark,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                    decoration: BoxDecoration(
+                                      color: AppColors.success.withValues(alpha: 0.15),
+                                      borderRadius: BorderRadius.circular(6),
+                                      border: Border.all(color: AppColors.success.withValues(alpha: 0.4)),
+                                    ),
+                                    child: Text(
+                                      'ONLINE',
+                                      style: GoogleFonts.poppins(
+                                        fontSize: 9.5,
+                                        fontWeight: FontWeight.w700,
+                                        color: AppColors.success,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            Text(
+                              'DEVICE PREVIEW',
+                              style: GoogleFonts.poppins(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.textSecondaryDark,
+                                letterSpacing: 0.8,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            Container(
+                              padding: const EdgeInsets.all(14),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1B2332),
+                                borderRadius: BorderRadius.circular(14),
+                                border: Border.all(color: const Color(0xFF2B3A50)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Container(
+                                        padding: const EdgeInsets.all(4),
+                                        decoration: BoxDecoration(
+                                          color: AppColors.primary,
+                                          borderRadius: BorderRadius.circular(6),
+                                        ),
+                                        child: const Icon(Icons.fitness_center_rounded, size: 12, color: Colors.white),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        'GCRM ONE',
+                                        style: GoogleFonts.poppins(
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w700,
+                                          color: Colors.white,
+                                          letterSpacing: 0.5,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        '• now',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 10.5,
+                                          color: AppColors.textSecondaryDark,
+                                        ),
+                                      ),
+                                      const Spacer(),
+                                      const Icon(Icons.volume_up_rounded, size: 13, color: AppColors.primary),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    titleCtrl.text.isNotEmpty ? titleCtrl.text : 'Notification Title Preview',
+                                    style: GoogleFonts.poppins(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    bodyCtrl.text.isNotEmpty ? bodyCtrl.text : 'Notification body message will appear here for recipients...',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12,
+                                      color: AppColors.textSecondaryDark,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 24),
+                            SizedBox(
+                              width: double.infinity,
+                              height: 48,
+                              child: ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: AppColors.primary,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  elevation: 4,
+                                ),
+                                icon: isSubmitting
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                        ),
+                                      )
+                                    : const Icon(Icons.send_rounded, color: Colors.white, size: 18),
+                                label: Text(
+                                  isSubmitting ? 'Dispatching Push Alert...' : 'Send Push Notification Now',
+                                  style: GoogleFonts.poppins(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                onPressed: isSubmitting
+                                    ? null
+                                    : () async {
+                                        if (!formKey.currentState!.validate()) return;
+                                        setModalState(() => isSubmitting = true);
+
+                                        final record = await widget.authController.sendPushNotification(
+                                          title: titleCtrl.text.trim(),
+                                          body: bodyCtrl.text.trim(),
+                                          targetAudience: targetAudience,
+                                          targetTenantId: targetAudience == 'specific_gym' ? selectedTenant?.id : null,
+                                          targetGymName: targetAudience == 'specific_gym' ? selectedTenant?.gymName : null,
+                                          sound: 'notification.mp3',
+                                        );
+
+                                        if (!mounted) return;
+                                        Navigator.pop(ctx);
+
+                                        if (record != null) {
+                                          ScaffoldMessenger.of(context).showSnackBar(
+                                            SnackBar(
+                                              content: Row(
+                                                children: [
+                                                  const Icon(Icons.check_circle_rounded, color: Colors.white, size: 20),
+                                                  const SizedBox(width: 10),
+                                                  Expanded(
+                                                    child: Text(
+                                                      'Push notification dispatched! Sound: notification.mp3',
+                                                      style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              backgroundColor: AppColors.success,
+                                              behavior: SnackBarBehavior.floating,
+                                            ),
+                                          );
+                                        }
+                                      },
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildAudienceChip({
+    required String label,
+    required IconData icon,
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+          decoration: BoxDecoration(
+            color: isSelected ? AppColors.primary.withValues(alpha: 0.18) : const Color(0xFF0F141E),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isSelected ? AppColors.primary : const Color(0xFF222B3C),
+              width: isSelected ? 1.5 : 1,
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: isSelected ? AppColors.primary : AppColors.textSecondaryDark),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                style: GoogleFonts.inter(
+                  fontSize: 11,
+                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                  color: isSelected ? Colors.white : AppColors.textSecondaryDark,
+                ),
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTemplateChip({required String label, required VoidCallback onTap}) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: const Color(0xFF161F2E),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xFF28364B)),
+        ),
+        child: Text(
+          label,
+          style: GoogleFonts.inter(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            color: Colors.white,
+          ),
+        ),
+      ),
+    );
+  }
+
   void _showAddGymDialog() {
     final nameCtrl = TextEditingController();
     final ownerCtrl = TextEditingController();
@@ -133,47 +699,18 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     DateTime startDate = DateTime.now();
     DateTime expiryDate = DateTime.now().add(const Duration(days: 365));
 
-    final defaultPlansList = [
-      const PlatformPlanModel(
-        id: 'starter_plan',
-        name: 'Starter Tier',
-        tagline: 'Basic check-in & member billing',
-        price: 24999.0,
-        billingPeriod: 'year',
-        features: ['Up to 250 Members', 'QR Check-in', 'Basic POS'],
-      ),
-      const PlatformPlanModel(
-        id: 'growth_plan',
-        name: 'Growth Pro',
-        tagline: 'Full gym management & trainer booking',
-        price: 69999.0,
-        billingPeriod: 'year',
-        features: [
-          'Up to 1000 Members',
-          'Trainer Booking',
-          'POS & Receipts',
-          'Analytics',
-        ],
-        isPopular: true,
-      ),
-      const PlatformPlanModel(
-        id: 'enterprise_plan',
-        name: 'Enterprise VIP',
-        tagline: 'Multi-branch & unlimited trainers',
-        price: 149999.0,
-        billingPeriod: 'year',
-        features: [
-          'Unlimited Members',
-          'Multi-Branch Access',
-          'Custom Branding',
-          '24/7 Dedicated Support',
-        ],
-      ),
-    ];
+    final fallbackPlan = const PlatformPlanModel(
+      id: '',
+      name: 'No Plans Available',
+      tagline: 'Please create a plan first',
+      price: 0.0,
+      billingPeriod: 'month',
+      features: [],
+    );
 
     final availablePlans = widget.authController.platformPlans.isNotEmpty
         ? widget.authController.platformPlans
-        : defaultPlansList;
+        : [fallbackPlan];
 
     PlatformPlanModel selectedPlan = availablePlans.first;
     SubscriptionTier selectedTier = SubscriptionTier.growth;
@@ -1412,47 +1949,18 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     DateTime startDate = tenant.planStartDate ?? tenant.createdAt;
     DateTime expiryDate = tenant.planExpiryDate ?? DateTime.now().add(const Duration(days: 365));
 
-    final defaultPlansList = [
-      const PlatformPlanModel(
-        id: 'starter_plan',
-        name: 'Starter Tier',
-        tagline: 'Basic check-in & member billing',
-        price: 24999.0,
-        billingPeriod: 'year',
-        features: ['Up to 250 Members', 'QR Check-in', 'Basic POS'],
-      ),
-      const PlatformPlanModel(
-        id: 'growth_plan',
-        name: 'Growth Pro',
-        tagline: 'Full gym management & trainer booking',
-        price: 69999.0,
-        billingPeriod: 'year',
-        features: [
-          'Up to 1000 Members',
-          'Trainer Booking',
-          'POS & Receipts',
-          'Analytics',
-        ],
-        isPopular: true,
-      ),
-      const PlatformPlanModel(
-        id: 'enterprise_plan',
-        name: 'Enterprise VIP',
-        tagline: 'Multi-branch & unlimited trainers',
-        price: 149999.0,
-        billingPeriod: 'year',
-        features: [
-          'Unlimited Members',
-          'Multi-Branch Access',
-          'Custom Branding',
-          '24/7 Dedicated Support',
-        ],
-      ),
-    ];
+    final fallbackPlan = const PlatformPlanModel(
+      id: '',
+      name: 'No Plans Available',
+      tagline: 'Please create a plan first',
+      price: 0.0,
+      billingPeriod: 'month',
+      features: [],
+    );
 
     final availablePlans = widget.authController.platformPlans.isNotEmpty
         ? widget.authController.platformPlans
-        : defaultPlansList;
+        : [fallbackPlan];
 
     PlatformPlanModel selectedPlan = availablePlans.firstWhere(
       (p) => p.id == tenant.planId,
@@ -1770,6 +2278,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                               : ImageOptimizer.buildImageWidget(
                                                   tenant.logoUrl,
                                                   fit: BoxFit.cover,
+                                                  primaryColor: selectedPrimaryColor,
                                                   placeholder: Center(
                                                     child: Icon(
                                                       Icons.fitness_center_rounded,
@@ -2833,9 +3342,17 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
         ),
         actions: [
           IconButton(
+            tooltip: 'Broadcast Push Notification',
+            icon: const Icon(Icons.campaign_rounded, color: AppColors.primary),
+            onPressed: () => _showSendNotificationDialog(),
+          ),
+          IconButton(
             tooltip: 'Refresh Metrics',
             icon: const Icon(Icons.refresh_rounded, color: Colors.white70),
-            onPressed: () => widget.authController.loadGymTenants(),
+            onPressed: () {
+              widget.authController.loadGymTenants();
+              widget.authController.loadNotificationsHistory();
+            },
           ),
           IconButton(
             tooltip: 'Sign Out',
@@ -2849,19 +3366,25 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
         icon: Icon(
           _selectedTabIndex == 0
               ? Icons.add_business_rounded
-              : Icons.add_circle_outline_rounded,
-          color: Colors.black,
+              : (_selectedTabIndex == 1
+                  ? Icons.add_circle_outline_rounded
+                  : Icons.campaign_rounded),
+          color: Colors.white,
         ),
         label: Text(
-          _selectedTabIndex == 0 ? 'Add Gym' : 'Add Plan',
+          _selectedTabIndex == 0
+              ? 'Add Gym'
+              : (_selectedTabIndex == 1 ? 'Add Plan' : 'Send Alert'),
           style: GoogleFonts.poppins(
             fontWeight: FontWeight.w700,
-            color: Colors.black,
+            color: Colors.white,
           ),
         ),
         onPressed: _selectedTabIndex == 0
             ? _showAddGymDialog
-            : _showAddPlanDialog,
+            : (_selectedTabIndex == 1
+                ? _showAddPlanDialog
+                : () => _showSendNotificationDialog()),
       ),
       body: SafeArea(
         child: AnimatedBuilder(
@@ -2877,11 +3400,11 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
             // Calculate KPIs
             final totalGyms = tenants.length;
             final totalMembers = tenants.fold<int>(
-              14850,
+              0,
               (int sum, GymTenantModel t) => sum + t.activeMembersCount,
             );
             final totalRevenue = tenants.fold<double>(
-              1485000.0,
+              0.0,
               (double sum, GymTenantModel t) => sum + t.monthlyRevenue,
             );
             final formattedRevenue =
@@ -2935,10 +3458,11 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                     ),
                     const SizedBox(height: 20),
 
-                    // 3. Navigation Tab Bar (Gyms vs Plans)
+                    // 3. Navigation Tab Bar (Gyms vs Plans vs Push Alerts)
                     _buildSectionTabs(
                       tenantsCount: tenants.length,
                       plansCount: plans.length,
+                      notificationsCount: widget.authController.sentNotifications.length,
                     ),
                     const SizedBox(height: 16),
 
@@ -2977,7 +3501,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                       ] else ...[
                         ...filteredTenants.map((t) => _buildTenantCard(t)),
                       ],
-                    ] else ...[
+                    ] else if (_selectedTabIndex == 1) ...[
                       // --- PLANS VIEW ---
                       _buildPlansHeader(plans.length),
                       const SizedBox(height: 12),
@@ -2986,6 +3510,12 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                       ] else ...[
                         ...plans.map((p) => _buildPlanCard(p)),
                       ],
+                    ] else ...[
+                      // --- PUSH ALERTS & BROADCASTS VIEW ---
+                      _buildNotificationsSection(
+                        widget.authController.sentNotifications,
+                        widget.authController.isLoadingNotifications,
+                      ),
                     ],
 
                     const SizedBox(height: 80), // FAB space
@@ -2999,7 +3529,11 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     );
   }
 
-  Widget _buildSectionTabs({required int tenantsCount, required int plansCount}) {
+  Widget _buildSectionTabs({
+    required int tenantsCount,
+    required int plansCount,
+    required int notificationsCount,
+  }) {
     return Container(
       padding: const EdgeInsets.all(4),
       decoration: BoxDecoration(
@@ -3040,20 +3574,23 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                   children: [
                     Icon(
                       Icons.fitness_center_rounded,
-                      size: 17,
+                      size: 15,
                       color: _selectedTabIndex == 0
-                          ? Colors.black
+                          ? Colors.white
                           : AppColors.textSecondaryDark,
                     ),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Gyms ($tenantsCount)',
-                      style: GoogleFonts.poppins(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700,
-                        color: _selectedTabIndex == 0
-                            ? Colors.black
-                            : AppColors.textSecondaryDark,
+                    const SizedBox(width: 5),
+                    Flexible(
+                      child: Text(
+                        'Gyms ($tenantsCount)',
+                        style: GoogleFonts.poppins(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: _selectedTabIndex == 0
+                              ? Colors.white
+                              : AppColors.textSecondaryDark,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ],
@@ -3092,26 +3629,322 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                   children: [
                     Icon(
                       Icons.card_membership_rounded,
-                      size: 17,
+                      size: 15,
                       color: _selectedTabIndex == 1
-                          ? Colors.black
+                          ? Colors.white
                           : AppColors.textSecondaryDark,
                     ),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Plans & Pricing ($plansCount)',
-                      style: GoogleFonts.poppins(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w700,
-                        color: _selectedTabIndex == 1
-                            ? Colors.black
-                            : AppColors.textSecondaryDark,
+                    const SizedBox(width: 5),
+                    Flexible(
+                      child: Text(
+                        'Plans & Pricing ($plansCount)',
+                        style: GoogleFonts.poppins(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: _selectedTabIndex == 1
+                              ? Colors.white
+                              : AppColors.textSecondaryDark,
+                        ),
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ],
                 ),
               ),
             ),
+          ),
+          Expanded(
+            child: GestureDetector(
+              onTap: () => setState(() => _selectedTabIndex = 2),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 200),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                decoration: BoxDecoration(
+                  gradient: _selectedTabIndex == 2
+                      ? const LinearGradient(
+                          colors: [
+                            AppColors.primary,
+                            Color(0xFFFF7043),
+                          ],
+                        )
+                      : null,
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: _selectedTabIndex == 2
+                      ? [
+                          BoxShadow(
+                            color: AppColors.primary.withValues(alpha: 0.35),
+                            blurRadius: 8,
+                            offset: const Offset(0, 2),
+                          ),
+                        ]
+                      : null,
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.campaign_rounded,
+                      size: 16,
+                      color: _selectedTabIndex == 2
+                          ? Colors.white
+                          : AppColors.textSecondaryDark,
+                    ),
+                    const SizedBox(width: 5),
+                    Flexible(
+                      child: Text(
+                        'Push Alerts ($notificationsCount)',
+                        style: GoogleFonts.poppins(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w700,
+                          color: _selectedTabIndex == 2
+                              ? Colors.white
+                              : AppColors.textSecondaryDark,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildNotificationsSection(List<PushNotificationRecord> history, bool isLoading) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Push Broadcasts (${history.length})',
+                  style: GoogleFonts.poppins(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+                Text(
+                  'Alert Sound: notification.mp3 active',
+                  style: GoogleFonts.inter(
+                    fontSize: 11.5,
+                    color: AppColors.primary,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ],
+            ),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.primary,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              icon: const Icon(Icons.campaign_rounded, size: 16, color: Colors.white),
+              label: Text(
+                'Send Alert',
+                style: GoogleFonts.poppins(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
+              ),
+              onPressed: () => _showSendNotificationDialog(),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        if (isLoading)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24.0),
+              child: CircularProgressIndicator(color: AppColors.primary),
+            ),
+          )
+        else if (history.isEmpty)
+          Container(
+            padding: const EdgeInsets.all(24),
+            decoration: BoxDecoration(
+              color: const Color(0xFF131822),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: const Color(0xFF222B3C)),
+            ),
+            child: Center(
+              child: Column(
+                children: [
+                  const Icon(Icons.notifications_none_rounded, size: 40, color: AppColors.textSecondaryDark),
+                  const SizedBox(height: 10),
+                  Text(
+                    'No Push Notifications Sent Yet',
+                    style: GoogleFonts.poppins(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Send instant notifications with custom sound to all gyms or specific facilities.',
+                    textAlign: TextAlign.center,
+                    style: GoogleFonts.inter(fontSize: 12.5, color: AppColors.textSecondaryDark),
+                  ),
+                  const SizedBox(height: 16),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: AppColors.primary),
+                    onPressed: () => _showSendNotificationDialog(),
+                    child: const Text('Compose Broadcast', style: TextStyle(color: Colors.white)),
+                  ),
+                ],
+              ),
+            ),
+          )
+        else
+          ...history.map((record) => _buildNotificationRecordCard(record)),
+      ],
+    );
+  }
+
+  Widget _buildNotificationRecordCard(PushNotificationRecord record) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF131822),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF222B3C)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: 0.15),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.campaign_rounded, size: 16, color: AppColors.primary),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      record.title,
+                      style: GoogleFonts.poppins(
+                        fontSize: 14.5,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                      ),
+                    ),
+                    Text(
+                      DateFormat('MMM d, y • h:mm a').format(record.createdAt),
+                      style: GoogleFonts.inter(
+                        fontSize: 11,
+                        color: AppColors.textSecondaryDark,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: (record.status == 'completed' || record.status == 'sent')
+                      ? AppColors.success.withValues(alpha: 0.15)
+                      : const Color(0xFFFFA000).withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  record.status.toUpperCase(),
+                  style: GoogleFonts.poppins(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w700,
+                    color: (record.status == 'completed' || record.status == 'sent')
+                        ? AppColors.success
+                        : const Color(0xFFFFA000),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(
+            record.body,
+            style: GoogleFonts.inter(
+              fontSize: 12.5,
+              color: const Color(0xFFCFD8DC),
+              height: 1.4,
+            ),
+          ),
+          const Divider(color: Color(0xFF222B3C), height: 18),
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E2837),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.people_alt_outlined, size: 12, color: AppColors.textSecondaryDark),
+                    const SizedBox(width: 4),
+                    Text(
+                      record.audienceDisplayLabel,
+                      style: GoogleFonts.inter(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.white70,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E2837),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.music_note_rounded, size: 12, color: AppColors.primary),
+                    const SizedBox(width: 4),
+                    Text(
+                      record.sound,
+                      style: GoogleFonts.inter(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.primary,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Spacer(),
+              if (record.recipientsCount > 0)
+                Text(
+                  '${record.recipientsCount} recipient(s)',
+                  style: GoogleFonts.inter(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.textSecondaryDark,
+                  ),
+                ),
+            ],
           ),
         ],
       ),
@@ -3218,12 +4051,12 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                 borderRadius: BorderRadius.circular(10),
               ),
             ),
-            icon: const Icon(Icons.add_rounded, size: 18, color: Colors.black),
+            icon: const Icon(Icons.add_rounded, size: 18, color: Colors.white),
             label: Text(
               'Add Plan',
               style: GoogleFonts.inter(
                 fontWeight: FontWeight.w700,
-                color: Colors.black,
+                color: Colors.white,
               ),
             ),
             onPressed: _showAddPlanDialog,
@@ -3688,7 +4521,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                 ),
                 const SizedBox(height: 3),
                 Text(
-                  email ?? 'superadmin@gcrmone.com',
+                  email ?? 'admin@domain.com',
                   style: GoogleFonts.inter(
                     fontSize: 12,
                     color: AppColors.textSecondaryDark,
@@ -3883,11 +4716,12 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                     style: GoogleFonts.inter(
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
-                      color: isSelected ? Colors.black : Colors.white70,
+                      color: isSelected ? Colors.white : Colors.white70,
                     ),
                   ),
                   selected: isSelected,
                   selectedColor: AppColors.primary,
+                  checkmarkColor: Colors.white,
                   backgroundColor: const Color(0xFF19202E),
                   side: BorderSide(
                     color: isSelected
@@ -3941,6 +4775,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                   child: ImageOptimizer.buildImageWidget(
                     tenant.logoUrl,
                     fit: BoxFit.cover,
+                    primaryColor: tenant.primaryColor,
                     placeholder: Center(
                       child: Text(
                         tenant.gymName.isNotEmpty
@@ -4208,6 +5043,34 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                             ),
                           );
                         },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  InkWell(
+                    onTap: () => _showSendNotificationDialog(preselectedTenant: tenant),
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: AppColors.primary.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: AppColors.primary.withValues(alpha: 0.4)),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.send_rounded, size: 12, color: AppColors.primary),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Notify',
+                            style: GoogleFonts.inter(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.primary,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ),

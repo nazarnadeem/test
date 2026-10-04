@@ -352,7 +352,7 @@ void main() {
       expect(member.isPresentOnDate(DateTime(2026, 8, 10)), isFalse);
 
       // Future date: false
-      expect(member.isPresentOnDate(DateTime(2026, 9, 30)), isFalse);
+      expect(member.isPresentOnDate(DateTime.now().add(const Duration(days: 30))), isFalse);
     });
 
     test('GymTeamMemberRecord serializes to and from JSON for Firestore with attendanceLogs', () {

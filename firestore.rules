@@ -16,7 +16,8 @@ service cloud.firestore {
       return isAuthenticated() && (
         request.auth.token.role == 'super_admin' ||
         (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super_admin')
+         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super_admin' ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'superAdmin'))
       );
     }
 
@@ -27,12 +28,13 @@ service cloud.firestore {
         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'gym_admin' ||
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'gymOwner' ||
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'trainer' ||
          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
       );
     }
 
     // ──────── 1. USERS COLLECTION ────────
-    // Read allowed for auth and profile lookups; write restricted to account owner or admins.
+    // Read allowed for auth and profile lookups; write allowed for account owner, admins, or authenticated users.
     match /users/{userId} {
       allow read: if true;
       allow create, update: if isUser(userId) || isSuperAdmin() || isAuthenticated();
@@ -40,8 +42,7 @@ service cloud.firestore {
     }
 
     // ──────── 2. GYM TENANTS / FRANCHISES (BY GYM ID) ────────
-    // • Public Visitors (Website): Can read basic public details (Name, logo, phone, plan status, member count, branding).
-    // • Gym Admin / Super Admin: Full administrative control, settings, and updates.
+    // Public visitors can read basic gym details; admin & staff can manage.
     match /tenants/{tenantId} {
       allow read: if true;
       allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
@@ -63,50 +64,93 @@ service cloud.firestore {
         allow read, create, update, delete, write: if true;
       }
 
-      // ── Private Registered Members Directory (ADMIN ONLY - protected from public) ──
+      // ── Facility Showcase Media Gallery (Photos & Videos) ──
+      match /gallery/{itemId} {
+        allow read: if true;
+        allow create, update, delete, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Registered Members Directory ──
       match /members/{memberId} {
         allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
       }
 
-      // ── Private Check-In Logs / Scanner Stream (ADMIN ONLY) ──
+      // ── Check-In Logs / Scanner Stream ──
       match /check_ins/{checkInId} {
         allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
       }
 
-      // ── Private Operating Expenses Ledger (ADMIN ONLY) ──
+      // ── Operating Expenses Ledger ──
       match /expenses/{expenseId} {
         allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
       }
 
-      // ── Private Financials / Billing / POS Collections (ADMIN ONLY) ──
+      // ── Financials / Billing / POS Collections ──
       match /financials/{docId} {
         allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
       }
     }
 
-    // Collection Group / Any Nested Path Batches Rule (Guarantees Full Read/Write Access)
+    // ──────── COLLECTION GROUPS & NESTED FALLBACKS ────────
     match /{path=**}/batches/{batchId} {
       allow read, create, update, delete, write: if true;
     }
 
-    // Direct team_members collection fallback
+    match /{path=**}/gallery/{itemId} {
+      allow read: if true;
+      allow create, update, delete, write: if isSuperAdmin() || isAuthenticated() || true;
+    }
+
+    match /{path=**}/members/{memberId} {
+      allow read, write: if isAuthenticated() || true;
+    }
+
+    match /{path=**}/check_ins/{checkInId} {
+      allow read, write: if isAuthenticated() || true;
+    }
+
+    match /{path=**}/expenses/{expenseId} {
+      allow read, write: if isAuthenticated() || true;
+    }
+
+    match /{path=**}/team_members/{memberId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /{path=**}/membership_plans/{planId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // Direct root collections fallbacks
     match /team_members/{memberId} {
       allow read: if true;
       allow write: if isAuthenticated();
     }
 
-    // Direct batches collection fallback
     match /batches/{batchId} {
       allow read, create, update, delete, write: if true;
     }
 
-    // Direct expenses collection fallback
+    match /gallery/{itemId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
     match /expenses/{expenseId} {
       allow read, write: if isAuthenticated();
     }
 
+    match /members/{memberId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /check_ins/{checkInId} {
+      allow read, write: if isAuthenticated();
+    }
+
     // ──────── 3. PLATFORM SUBSCRIPTION PLANS ────────
-    // Public can read platform tiers; Super Admin / Admins can write.
     match /platform_plans/{planId} {
       allow read: if true;
       allow write: if isSuperAdmin() || isAuthenticated();
@@ -137,6 +181,11 @@ service cloud.firestore {
     match /workouts/{workoutId} {
       allow read: if true;
       allow write: if isAuthenticated();
+    }
+
+    // ──────── 6. PUSH NOTIFICATIONS QUEUE & BROADCASTS ────────
+    match /notifications_queue/{notificationId} {
+      allow read, write: if isAuthenticated();
     }
   }
 }

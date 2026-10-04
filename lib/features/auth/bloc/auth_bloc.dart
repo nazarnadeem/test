@@ -3,6 +3,7 @@ import 'auth_event.dart';
 import 'auth_state.dart';
 import '../data/repositories/auth_repository.dart';
 import '../data/repositories/firebase_auth_service.dart';
+import '../../../core/services/notification_service.dart';
 
 /// Streamlined BLoC for Authentication and Firebase Login.
 class AuthBloc extends Bloc<AuthEvent, AuthState> {
@@ -27,6 +28,9 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
     try {
       final session = await _authRepository.getCurrentSession();
       if (session != null && !session.isExpired) {
+        // Initialize Push Notifications for authenticated user
+        NotificationService.initializeAndSaveToken(session.user.id);
+
         emit(state.copyWith(
           status: AuthStatus.authenticated,
           session: session,
@@ -50,6 +54,10 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
         email: event.email,
         password: event.password,
       );
+      
+      // Initialize Push Notifications for authenticated user
+      NotificationService.initializeAndSaveToken(session.user.id);
+
       emit(state.copyWith(
         status: AuthStatus.authenticated,
         session: session,
@@ -77,6 +85,9 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
         securityPin: event.securityPin,
         organization: event.organization,
       );
+      // Initialize Push Notifications for authenticated user
+      NotificationService.initializeAndSaveToken(session.user.id);
+
       emit(state.copyWith(
         status: AuthStatus.authenticated,
         session: session,
@@ -123,6 +134,10 @@ class AuthBloc extends Bloc<AuthEvent, AuthState> {
   ) async {
     emit(state.copyWith(status: AuthStatus.loading));
     try {
+      final currentUserId = state.user?.id;
+      if (currentUserId != null) {
+        await NotificationService.clearTokenOnLogout(currentUserId);
+      }
       await _authRepository.logout();
     } finally {
       emit(const AuthState(status: AuthStatus.unauthenticated));

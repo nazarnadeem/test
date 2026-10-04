@@ -73,6 +73,36 @@ void main() {
       expect(restored.batchId, 'btch_morn');
       expect(restored.batchName, 'Morning Elite (06:00 AM - 07:30 AM)');
     });
+
+    test('GymMemberModel.copyWith clears batchId and batchName properly when set to null or clearBatch: true', () {
+      final member = GymMemberModel(
+        id: 'mem_102',
+        firstName: 'Elena',
+        lastName: 'Rostova',
+        phone: '+91 9112233445',
+        membershipPlan: 'Pro Pass',
+        batchId: 'btch_morn',
+        batchName: 'Morning Elite (06:00 AM - 07:30 AM)',
+        startDate: DateTime.now(),
+        expiryDate: DateTime.now().add(const Duration(days: 30)),
+      );
+
+      // Clearing via batchId: null and batchName: null
+      final cleared1 = member.copyWith(batchId: null, batchName: null);
+      expect(cleared1.batchId, isNull);
+      expect(cleared1.batchName, isNull);
+
+      // Clearing via clearBatch: true
+      final cleared2 = member.copyWith(clearBatch: true);
+      expect(cleared2.batchId, isNull);
+      expect(cleared2.batchName, isNull);
+
+      // Preserving batch when other fields change
+      final updatedPhone = member.copyWith(phone: '+91 9999999999');
+      expect(updatedPhone.batchId, 'btch_morn');
+      expect(updatedPhone.batchName, 'Morning Elite (06:00 AM - 07:30 AM)');
+      expect(updatedPhone.phone, '+91 9999999999');
+    });
   });
 
   group('Gym Admin Batches Controller & Repository Tests', () {
@@ -284,9 +314,158 @@ void main() {
 
       expect(find.text('Marcus Vance'), findsOneWidget);
       await tester.tap(find.text('Marcus Vance'), warnIfMissed: false);
+      expect(find.byType(CheckboxListTile), findsWidgets);
+    });
+
+    testWidgets('Prevents deleting a batch when members are linked and shows error', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 1600));
+
+      // Add a batch with 1 member linked
+      await authController.addGymBatch(
+        GymBatchModel(
+          id: 'btch_with_members',
+          name: 'Pilates Power',
+          time: '08:00 AM - 09:30 AM',
+          limit: 10,
+          memberIds: ['mem_widget_01'],
+          memberNames: ['Marcus Vance'],
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
       await tester.pumpAndSettle();
 
+      await tester.tap(find.text('Batches'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Pilates Power'), findsOneWidget);
+
+      // Try to delete batch with member
+      final deleteButtons = find.widgetWithText(OutlinedButton, 'Delete');
+      await tester.tap(deleteButtons.first);
+      await tester.pumpAndSettle();
+
+      // Verify error message is shown and batch is NOT deleted
+      expect(
+        find.text('1 members are linked with this batch firstly remove these members from batch by editing the batch'),
+        findsOneWidget,
+      );
+      expect(find.text('Pilates Power'), findsOneWidget);
+    });
+
+    testWidgets('Allows deleting a batch when no members are linked', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 1600));
+
+      // Add a batch with 0 members linked
+      await authController.addGymBatch(
+        const GymBatchModel(
+          id: 'btch_empty',
+          name: 'Empty Batch Demo',
+          time: '11:00 AM - 12:00 PM',
+          limit: 10,
+          memberIds: [],
+          memberNames: [],
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Batches'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Empty Batch Demo'), findsOneWidget);
+
+      // Tap Delete on the empty batch
+      final deleteButtons = find.widgetWithText(OutlinedButton, 'Delete');
+      await tester.tap(deleteButtons.first);
+      await tester.pumpAndSettle();
+
+      // Verify confirmation dialog opens
+      expect(find.text('Delete Batch'), findsOneWidget);
+      expect(find.text('Are you sure you want to delete "Empty Batch Demo"?'), findsOneWidget);
+
+      // Confirm delete
+      await tester.tap(find.widgetWithText(ElevatedButton, 'Delete'));
+      await tester.pumpAndSettle();
+
+      // Verify batch was removed
+      expect(find.text('Empty Batch Demo'), findsNothing);
+    });
+
+    testWidgets('Removing a member from batch in edit dialog clears the member batchId and updates state', (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(1200, 1600));
+
+      // 1. Create a batch with Marcus Vance linked
+      final batch = GymBatchModel(
+        id: 'btch_marcus_sync',
+        name: 'Iron Club',
+        time: '06:00 AM - 07:30 AM',
+        limit: 10,
+        memberIds: ['mem_widget_01'],
+        memberNames: ['Marcus Vance'],
+      );
+      await authController.addGymBatch(batch);
+
+      // Set member's batchId to this batch
+      final existingMem = authController.members.firstWhere((m) => m.id == 'mem_widget_01');
+      await authController.updateGymMember(
+        existingMem.copyWith(batchId: 'btch_marcus_sync', batchName: 'Iron Club (06:00 AM - 07:30 AM)'),
+      );
+      expect(authController.members.firstWhere((m) => m.id == 'mem_widget_01').batchId, 'btch_marcus_sync');
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: GymAdminDashboardScreen(authController: authController),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Go to Batches tab
+      await tester.tap(find.text('Batches'));
+      await tester.pumpAndSettle();
+
+      // Open Edit Batch modal
+      await tester.tap(find.widgetWithText(OutlinedButton, 'Edit Batch').first);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Edit Batch Details'), findsOneWidget);
+
+      // Deselect Marcus Vance
       expect(find.byType(CheckboxListTile), findsWidgets);
+      await tester.ensureVisible(find.byType(CheckboxListTile).first);
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(CheckboxListTile).first);
+      await tester.pumpAndSettle();
+
+      // Submit update batch
+      await tester.ensureVisible(find.text('Update Batch'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Update Batch'));
+      await tester.pumpAndSettle();
+
+      // Verify batch no longer has Marcus Vance
+      final updatedBatch = authController.batches.firstWhere((b) => b.id == 'btch_marcus_sync');
+      expect(updatedBatch.memberIds.contains('mem_widget_01'), false);
+
+      // CRITICAL: Verify member is updated and no longer has batchId
+      final updatedMember = authController.members.firstWhere((m) => m.id == 'mem_widget_01');
+      expect(updatedMember.batchId, isNull);
+      expect(updatedMember.batchName, isNull);
+
+      // Check Members tab to ensure it shows 'Batch: Unassigned'
+      await tester.tap(find.text('Members'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Batch: Unassigned'), findsOneWidget);
     });
   });
 }

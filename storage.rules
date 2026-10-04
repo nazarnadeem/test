@@ -18,12 +18,17 @@ service firebase.storage {
       allow read, write: if true;
     }
     
+    // Gym facility showcase media (photos & videos)
+    match /tenants/{tenantId}/gallery/{allPaths=**} {
+      allow read, write: if true;
+    }
+    
     // User profile photos (publicly readable, writeable)
     match /users/{userId}/{allPaths=**} {
       allow read, write: if true;
     }
 
-    // Default global rule
+    // Default global rule for all other assets
     match /{allPaths=**} {
       allow read, write: if true;
     }

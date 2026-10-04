@@ -1,10 +1,14 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import '../../../../core/constants/app_colors.dart';
+import '../../../../core/services/notification_service.dart';
 import '../../../../core/utils/image_optimizer.dart';
+import '../../../../core/utils/video_optimizer.dart';
+import '../../../../core/utils/icard_generator.dart';
 import '../../../../core/widgets/custom_button.dart';
 import '../../../../core/widgets/custom_text_field.dart';
 import '../../controllers/auth_controller.dart';
@@ -15,7 +19,10 @@ import '../../data/models/gym_member_model.dart';
 import '../../data/models/gym_expense_model.dart';
 import '../../data/models/gym_check_in_model.dart';
 import '../../data/models/gym_batch_model.dart';
+import '../../data/models/gym_gallery_item_model.dart';
+import '../widgets/gallery_video_player.dart';
 import 'login_screen.dart';
+import 'qr_check_in_scanner_screen.dart';
 
 export '../../data/models/gym_team_member_model.dart';
 export '../../data/models/gym_membership_plan_model.dart';
@@ -23,6 +30,7 @@ export '../../data/models/gym_member_model.dart';
 export '../../data/models/gym_expense_model.dart';
 export '../../data/models/gym_check_in_model.dart';
 export '../../data/models/gym_batch_model.dart';
+export '../../data/models/gym_gallery_item_model.dart';
 
 /// Backward-compatible alias
 typedef GymMemberRecord = GymMemberModel;
@@ -48,6 +56,8 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   int _selectedTabIndex = 0;
   String _memberSearchQuery = '';
   String _selectedMemberFilter = 'All';
+  String _selectedExpiringFilter = '7D'; // '1D', '3D', or '7D' (D = Days)
+  String? _expandedMemberId; // null = all members collapsed by default (accordion behavior)
 
   // In-memory demo data for Gym Admin workspace
   late List<GymMemberRecord> _members;
@@ -56,6 +66,8 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   late List<GymCheckInLog> _recentCheckIns;
   late List<GymExpenseRecord> _expenses;
   late List<GymBatchModel> _batches;
+  late List<GymGalleryItemModel> _galleryItems;
+  String _galleryFilter = 'All'; // 'All', 'Photos', 'Videos'
   String _teamSearchQuery = '';
   String _selectedTeamFilter = 'All';
   String _planSearchQuery = '';
@@ -69,10 +81,17 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   int? _selectedSalesPointIndex;
   final Map<String, Map<String, bool>> _staffAttendanceOverrides = {};
 
+  // Push Notifications Listener & History
+  StreamSubscription<PushNotificationAlert>? _notificationAlertSub;
+  final List<PushNotificationAlert> _receivedNotifications = [];
+  final Set<String> _dismissedNotificationIds = {};
+  int _unreadNotificationCount = 0;
+  bool _isLoadingNotificationInbox = false;
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 7, vsync: this);
+    _tabController = TabController(length: 8, vsync: this);
     _tabController.addListener(() {
       if (_tabController.indexIsChanging || _tabController.index != _selectedTabIndex) {
         setState(() {
@@ -87,10 +106,78 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     _recentCheckIns = List.from(widget.authController.checkIns);
     _expenses = List.from(widget.authController.expenses);
     _batches = List.from(widget.authController.batches);
+    _galleryItems = List.from(widget.authController.galleryItems);
+
+    // Initialize & bind FCM Push Notification token for Gym Admin
+    final currentUser = widget.authController.currentUser;
+    final tid = _gymTenantId();
+    if (currentUser != null) {
+      NotificationService.initializeAndSaveToken(
+        currentUser.id,
+        tenantId: tid,
+        role: currentUser.role.name,
+      );
+      NotificationService.startRealtimeListener(
+        tenantId: tid,
+        userId: currentUser.id,
+      );
+    }
+
+    // Subscribe to incoming push notification alerts
+    _notificationAlertSub = NotificationService.onNotificationAlert.listen((alert) {
+      if (!mounted || _dismissedNotificationIds.contains(alert.id)) return;
+      final alreadyListed = _receivedNotifications.any((item) => item.id == alert.id);
+      setState(() {
+        if (!alreadyListed) {
+          _receivedNotifications.insert(0, alert);
+        }
+        _unreadNotificationCount++;
+      });
+      SystemSound.play(SystemSoundType.alert);
+      HapticFeedback.heavyImpact();
+      _showInAppNotificationBanner(alert);
+    });
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _refreshOverviewData(forceRefresh: false);
+      _loadNotificationInbox();
+    });
+  }
+
+  String? _gymTenantId() {
+    final user = widget.authController.currentUser;
+    final tenantId = widget.authController.currentGymTenant?.id ?? user?.tenantId;
+    if (tenantId == null || tenantId.trim().isEmpty || tenantId == 'default_tenant') {
+      return user?.tenantId;
+    }
+    return tenantId;
+  }
+
+  Future<void> _loadNotificationInbox() async {
+    final user = widget.authController.currentUser;
+    if (user == null) return;
+    setState(() => _isLoadingNotificationInbox = true);
+    final alerts = await NotificationService.loadInbox(
+      userId: user.id,
+      tenantId: _gymTenantId(),
+    );
+    if (!mounted) return;
+    setState(() {
+      final merged = <String, PushNotificationAlert>{
+        for (final alert in _receivedNotifications)
+          if (!_dismissedNotificationIds.contains(alert.id)) alert.id: alert,
+      };
+      for (final alert in alerts) {
+        if (_dismissedNotificationIds.contains(alert.id)) continue;
+        merged.putIfAbsent(alert.id, () => alert);
+      }
+      final sorted = merged.values.toList()
+        ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+      _receivedNotifications
+        ..clear()
+        ..addAll(sorted);
+      _isLoadingNotificationInbox = false;
     });
   }
 
@@ -104,12 +191,20 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         _expenses = List.from(widget.authController.expenses);
         _recentCheckIns = List.from(widget.authController.checkIns);
         _batches = List.from(widget.authController.batches);
+        _galleryItems = List.from(widget.authController.galleryItems);
       });
     }
   }
 
   Future<void> _fetchMembersWithServerFilter(String filterStatus) async {
-    setState(() => _selectedMemberFilter = filterStatus);
+    setState(() {
+      _selectedMemberFilter = filterStatus;
+      _expandedMemberId = null;
+      if (filterStatus == 'Expiring') {
+        _selectedExpiringFilter = '7D';
+      }
+    });
+    final prevMembers = List<GymMemberRecord>.from(_members);
     await widget.authController.loadGymMembers(
       forceRefresh: true,
       filterStatus: filterStatus,
@@ -117,7 +212,12 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
     if (mounted) {
       setState(() {
-        _members = List.from(widget.authController.members);
+        final newMembers = widget.authController.members;
+        if (newMembers.isNotEmpty || filterStatus == 'All') {
+          _members = List.from(newMembers);
+        } else if (prevMembers.isNotEmpty) {
+          _members = prevMembers;
+        }
       });
     }
   }
@@ -133,6 +233,8 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
 
   @override
   void dispose() {
+    _notificationAlertSub?.cancel();
+    NotificationService.stopRealtimeListener();
     _tabController.dispose();
     super.dispose();
   }
@@ -152,6 +254,262 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
       if (match.isNotEmpty) return match.first;
     }
     return null;
+  }
+
+  void _showInAppNotificationBanner(PushNotificationAlert alert) {
+    if (!mounted) return;
+    final primaryColor = _resolveCurrentTenant()?.primaryColor ?? AppColors.primary;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: const Color(0xFF161F30),
+        elevation: 12,
+        margin: const EdgeInsets.only(top: 16, left: 16, right: 16, bottom: 20),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: primaryColor.withValues(alpha: 0.8), width: 1.5),
+        ),
+        duration: const Duration(seconds: 6),
+        content: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: primaryColor.withValues(alpha: 0.2),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(Icons.campaign_rounded, color: primaryColor, size: 22),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          alert.title,
+                          style: GoogleFonts.poppins(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: primaryColor.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          'PLATFORM ALERT',
+                          style: GoogleFonts.inter(
+                            fontSize: 8.5,
+                            fontWeight: FontWeight.w800,
+                            color: primaryColor,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    alert.body,
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      color: AppColors.textSecondaryDark,
+                      height: 1.35,
+                    ),
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openNotificationCenter() async {
+    await _loadNotificationInbox();
+    if (!mounted) return;
+    setState(() {
+      _unreadNotificationCount = 0;
+    });
+    _showNotificationCenterSheet();
+  }
+
+  void _showNotificationCenterSheet() {
+    final primaryColor = _resolveCurrentTenant()?.primaryColor ?? AppColors.primary;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF101725),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setModalState) => SafeArea(
+          child: Container(
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.75,
+            ),
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 44,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: Colors.white24,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: primaryColor.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(Icons.notifications_active_rounded, color: primaryColor, size: 20),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Platform Broadcasts',
+                        style: GoogleFonts.poppins(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    if (_receivedNotifications.isNotEmpty)
+                      TextButton.icon(
+                        onPressed: () {
+                          setState(() {
+                            _dismissedNotificationIds.addAll(
+                              _receivedNotifications.map((alert) => alert.id),
+                            );
+                            _receivedNotifications.clear();
+                          });
+                          setModalState(() {});
+                        },
+                        icon: const Icon(Icons.clear_all_rounded, size: 16, color: Colors.white54),
+                        label: Text(
+                          'Clear',
+                          style: GoogleFonts.inter(fontSize: 12, color: Colors.white54),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                const Divider(color: Color(0xFF1E2B3E), height: 1),
+                const SizedBox(height: 14),
+                Expanded(
+                  child: _isLoadingNotificationInbox
+                      ? const Center(
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : _receivedNotifications.isEmpty
+                      ? Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const Icon(Icons.notifications_off_outlined,
+                                  size: 48, color: Colors.white24),
+                              const SizedBox(height: 12),
+                              Text(
+                                'No notifications yet',
+                                style: GoogleFonts.inter(
+                                  fontSize: 14,
+                                  color: Colors.white54,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Announcements from Super Admin will appear here.',
+                                style: GoogleFonts.inter(
+                                  fontSize: 12,
+                                  color: Colors.white30,
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : ListView.separated(
+                          itemCount: _receivedNotifications.length,
+                          separatorBuilder: (_, __) => const SizedBox(height: 10),
+                          itemBuilder: (_, index) {
+                            final alert = _receivedNotifications[index];
+                            final timeStr = DateFormat('MMM dd, hh:mm a').format(alert.receivedAt);
+                            return Container(
+                              padding: const EdgeInsets.all(14),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF151D2A),
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(color: const Color(0xFF223046)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          alert.title,
+                                          style: GoogleFonts.poppins(
+                                            fontSize: 14,
+                                            fontWeight: FontWeight.w700,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ),
+                                      Text(
+                                        timeStr,
+                                        style: GoogleFonts.inter(
+                                          fontSize: 11,
+                                          color: Colors.white38,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 6),
+                                  Text(
+                                    alert.body,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 12.5,
+                                      color: AppColors.textSecondaryDark,
+                                      height: 1.4,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _handleLogout() async {
@@ -204,6 +562,23 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     }
   }
 
+  /// Returns batches that haven't crossed the member limit.
+  /// If [currentBatchId] is specified (e.g. when editing a member), that member's
+  /// current batch is retained in the options even if it is currently full.
+  List<GymBatchModel> _getAvailableBatches({String? currentBatchId}) {
+    final allMembers = _members.isNotEmpty ? _members : widget.authController.members;
+    return _batches.where((b) {
+      if (currentBatchId != null && b.id == currentBatchId) return true;
+      if (b.limit <= 0) return true;
+      final linkedIds = <String>{
+        ...b.memberIds,
+        ...allMembers.where((m) => m.batchId == b.id).map((m) => m.id),
+      };
+      final count = linkedIds.isNotEmpty ? linkedIds.length : b.memberIds.length;
+      return !b.isFull && count < b.limit;
+    }).toList();
+  }
+
   void _showAddMemberDialog(Color primaryColor) {
     final firstNameCtrl = TextEditingController();
     final lastNameCtrl = TextEditingController();
@@ -219,7 +594,8 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
 
     String selectedGender = 'Male';
     DateTime? selectedDob;
-    DateTime selectedStartDate = DateTime.now();
+    final now = DateTime.now();
+    DateTime selectedStartDate = DateTime(now.year, now.month, now.day);
     String selectedEmergencyRelation = 'Parent';
     String selectedGoal = 'General Fitness';
     String selectedDiscountType = 'Fixed'; // 'Fixed' or 'Percentage'
@@ -325,11 +701,15 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     }
 
     Future<void> pickStartDate(BuildContext context, StateSetter setModalState) async {
+      final now = DateTime.now();
+      final todayMidnight = DateTime(now.year, now.month, now.day);
+      final initial = selectedStartDate.isAfter(todayMidnight) ? todayMidnight : selectedStartDate;
       final picked = await showDatePicker(
         context: context,
-        initialDate: selectedStartDate,
+        initialDate: initial,
         firstDate: DateTime(2020),
-        lastDate: DateTime(2100),
+        lastDate: todayMidnight,
+        helpText: 'SELECT PLAN START DATE (UP TO TODAY)',
         builder: (context, child) {
           return Theme(
             data: Theme.of(context).copyWith(
@@ -348,6 +728,15 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         },
       );
       if (picked != null) {
+        if (picked.isAfter(todayMidnight)) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Plan start date cannot be in the future.'),
+              backgroundColor: AppColors.error,
+            ),
+          );
+          return;
+        }
         setModalState(() {
           selectedStartDate = picked;
         });
@@ -524,12 +913,13 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                     ),
                                     const SizedBox(width: 4),
                                     TextButton.icon(
-                                      icon: const Icon(Icons.auto_awesome_rounded, size: 15, color: AppColors.accentCyan),
+                                      icon: const Icon(Icons.auto_awesome_rounded, size: 16),
                                       label: Text(
                                         'Demo Photo',
-                                        style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w600, color: AppColors.accentCyan),
+                                        style: GoogleFonts.inter(fontSize: 12, fontWeight: FontWeight.w600),
                                       ),
                                       style: TextButton.styleFrom(
+                                        foregroundColor: Colors.white70,
                                         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                                       ),
                                       onPressed: () => useSamplePhoto(setModalState),
@@ -1024,65 +1414,72 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                       ),
                                     ),
                                     const SizedBox(height: 6),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFF19202E),
-                                        borderRadius: BorderRadius.circular(12),
-                                        border: Border.all(color: const Color(0xFF283448)),
-                                      ),
-                                      child: DropdownButtonHideUnderline(
-                                        child: DropdownButton<String?>(
-                                          value: selectedBatchId,
-                                          dropdownColor: const Color(0xFF19202E),
-                                          icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
-                                          isExpanded: true,
-                                          items: [
-                                            DropdownMenuItem<String?>(
-                                              value: null,
-                                              child: Row(
-                                                children: [
-                                                  const Icon(Icons.schedule_rounded, size: 16, color: Colors.white38),
-                                                  const SizedBox(width: 8),
-                                                  Text(
-                                                    'No Batch Assigned',
-                                                    style: GoogleFonts.inter(fontSize: 13, color: Colors.white54),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                            ..._batches.map((b) {
-                                              return DropdownMenuItem<String?>(
-                                                value: b.id,
-                                                child: Row(
-                                                  children: [
-                                                    const Icon(Icons.schedule_rounded, size: 16, color: AppColors.accentCyan),
-                                                    const SizedBox(width: 8),
-                                                    Expanded(
-                                                      child: Text(
-                                                        '${b.name} (${b.time})',
-                                                        style: GoogleFonts.inter(fontSize: 13, color: Colors.white, fontWeight: FontWeight.w600),
-                                                        overflow: TextOverflow.ellipsis,
+                                    Builder(
+                                      builder: (context) {
+                                        final availableBatches = _getAvailableBatches();
+                                        return Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF19202E),
+                                            borderRadius: BorderRadius.circular(12),
+                                            border: Border.all(color: const Color(0xFF283448)),
+                                          ),
+                                          child: DropdownButtonHideUnderline(
+                                            child: DropdownButton<String?>(
+                                              value: (selectedBatchId != null && availableBatches.any((b) => b.id == selectedBatchId))
+                                                  ? selectedBatchId
+                                                  : null,
+                                              dropdownColor: const Color(0xFF19202E),
+                                              icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
+                                              isExpanded: true,
+                                              items: [
+                                                DropdownMenuItem<String?>(
+                                                  value: null,
+                                                  child: Row(
+                                                    children: [
+                                                      const Icon(Icons.schedule_rounded, size: 16, color: Colors.white38),
+                                                      const SizedBox(width: 8),
+                                                      Text(
+                                                        'No Batch Assigned',
+                                                        style: GoogleFonts.inter(fontSize: 13, color: Colors.white54),
                                                       ),
-                                                    ),
-                                                  ],
+                                                    ],
+                                                  ),
                                                 ),
-                                              );
-                                            }),
-                                          ],
-                                          onChanged: (val) {
-                                            setModalState(() {
-                                              selectedBatchId = val;
-                                              if (val != null) {
-                                                final match = _batches.where((b) => b.id == val);
-                                                selectedBatchName = match.isNotEmpty ? '${match.first.name} (${match.first.time})' : null;
-                                              } else {
-                                                selectedBatchName = null;
-                                              }
-                                            });
-                                          },
-                                        ),
-                                      ),
+                                                ...availableBatches.map((b) {
+                                                  return DropdownMenuItem<String?>(
+                                                    value: b.id,
+                                                    child: Row(
+                                                      children: [
+                                                        const Icon(Icons.schedule_rounded, size: 16, color: AppColors.accentCyan),
+                                                        const SizedBox(width: 8),
+                                                        Expanded(
+                                                          child: Text(
+                                                            '${b.name} (${b.time})',
+                                                            style: GoogleFonts.inter(fontSize: 13, color: Colors.white, fontWeight: FontWeight.w600),
+                                                            overflow: TextOverflow.ellipsis,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  );
+                                                }),
+                                              ],
+                                              onChanged: (val) {
+                                                setModalState(() {
+                                                  selectedBatchId = val;
+                                                  if (val != null) {
+                                                    final match = availableBatches.where((b) => b.id == val);
+                                                    selectedBatchName = match.isNotEmpty ? '${match.first.name} (${match.first.time})' : null;
+                                                  } else {
+                                                    selectedBatchName = null;
+                                                  }
+                                                });
+                                              },
+                                            ),
+                                          ),
+                                        );
+                                      },
                                     ),
                                   ],
                                 ),
@@ -1273,7 +1670,14 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                             selectedColor: planModel?.accentColor ?? primaryColor,
                                             backgroundColor: const Color(0xFF19202E),
                                             onSelected: (_) {
-                                              setModalState(() => selectedPlan = planName);
+                                              setModalState(() {
+                                                selectedPlan = planName;
+                                                final now = DateTime.now();
+                                                final todayMidnight = DateTime(now.year, now.month, now.day);
+                                                if (selectedStartDate.isAfter(todayMidnight)) {
+                                                  selectedStartDate = todayMidnight;
+                                                }
+                                              });
                                             },
                                           );
                                         }).toList(),
@@ -1287,7 +1691,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                     builder: (context) {
                                       final planModel = _membershipPlans.where((p) => p.name == selectedPlan).firstOrNull;
                                       final durationDays = planModel?.durationDays ?? (selectedPlan.contains('Annual') ? 365 : 30);
-                                      final calculatedEndDate = selectedStartDate.add(Duration(days: durationDays));
+                                      final calculatedEndDate = selectedStartDate.add(Duration(days: durationDays > 0 ? durationDays - 1 : 0));
                                       final isExpiredDate = calculatedEndDate.isBefore(DateTime.now());
 
                                       return Container(
@@ -1613,16 +2017,26 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                             isLoading: isSubmitting,
                             onPressed: () async {
                               if (!formKey.currentState!.validate()) return;
+                              final now = DateTime.now();
+                              final todayMidnight = DateTime(now.year, now.month, now.day);
+                              if (selectedStartDate.isAfter(todayMidnight)) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Plan start date cannot be in the future.'),
+                                    backgroundColor: AppColors.error,
+                                  ),
+                                );
+                                return;
+                              }
                               setModalState(() => isSubmitting = true);
 
                               final planModel = _membershipPlans.where((p) => p.name == selectedPlan).firstOrNull;
-                              final duration = isLifetimeFree
-                                  ? const Duration(days: 36500)
+                              final durationDays = isLifetimeFree
+                                  ? 36500
                                   : (planModel != null
-                                      ? Duration(days: planModel.durationDays)
-                                      : (selectedPlan.contains('Annual')
-                                          ? const Duration(days: 365)
-                                          : const Duration(days: 30)));
+                                      ? planModel.durationDays
+                                      : (selectedPlan.contains('Annual') ? 365 : 30));
+                              final duration = Duration(days: durationDays > 0 ? durationDays - 1 : 0);
 
                               final emgName = emergencyNameCtrl.text.trim();
                               final emgPhone = emergencyPhoneCtrl.text.trim();
@@ -1656,6 +2070,33 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                 startDate: selectedStartDate,
                                 expiryDate: isLifetimeFree ? DateTime(2099, 12, 31) : selectedStartDate.add(duration),
                               );
+
+                              if (selectedBatchId != null) {
+                                final matchIdx = _batches.indexWhere((b) => b.id == selectedBatchId);
+                                if (matchIdx != -1) {
+                                  final batch = _batches[matchIdx];
+                                  final allMembers = _members.isNotEmpty ? _members : widget.authController.members;
+                                  final linkedIds = <String>{
+                                    ...batch.memberIds,
+                                    ...allMembers.where((m) => m.batchId == batch.id).map((m) => m.id),
+                                  };
+                                  final count = linkedIds.isNotEmpty ? linkedIds.length : batch.memberIds.length;
+                                  if (batch.limit > 0 && (batch.isFull || count >= batch.limit)) {
+                                    setModalState(() => isSubmitting = false);
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(
+                                          'Selected batch "${batch.name}" has reached its member limit ($count/${batch.limit}). Please choose another batch.',
+                                          style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                                        ),
+                                        backgroundColor: AppColors.error,
+                                        behavior: SnackBarBehavior.floating,
+                                      ),
+                                    );
+                                    return;
+                                  }
+                                }
+                              }
 
                               final navigator = Navigator.of(ctx);
                               final messenger = ScaffoldMessenger.of(context);
@@ -1750,7 +2191,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     final ImagePicker picker = ImagePicker();
     String selectedGender = member.gender;
     DateTime? selectedDob = member.dateOfBirth;
-    DateTime selectedStartDate = member.startDate;
+    final mStart = member.startDate.toLocal();
+    final now = DateTime.now();
+    final todayMidnight = DateTime(now.year, now.month, now.day);
+    final rawStart = DateTime(mStart.year, mStart.month, mStart.day);
+    DateTime selectedStartDate = rawStart.isAfter(todayMidnight) ? todayMidnight : rawStart;
     String selectedEmergencyRelation = member.emergencyContactRelation ?? 'Parent';
     String selectedDiscountType = member.discountType ?? 'Fixed';
     const fitnessGoals = [
@@ -1860,11 +2305,15 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     }
 
     Future<void> pickStartDate(BuildContext context, StateSetter setModalState) async {
+      final now = DateTime.now();
+      final todayMidnight = DateTime(now.year, now.month, now.day);
+      final initial = selectedStartDate.isAfter(todayMidnight) ? todayMidnight : selectedStartDate;
       final picked = await showDatePicker(
         context: context,
-        initialDate: selectedStartDate,
+        initialDate: initial,
         firstDate: DateTime(2020),
-        lastDate: DateTime(2100),
+        lastDate: todayMidnight,
+        helpText: 'SELECT PLAN START DATE (UP TO TODAY)',
         builder: (context, child) {
           return Theme(
             data: Theme.of(context).copyWith(
@@ -1883,6 +2332,15 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         },
       );
       if (picked != null) {
+        if (picked.isAfter(todayMidnight)) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Plan start date cannot be in the future.'),
+              backgroundColor: AppColors.error,
+            ),
+          );
+          return;
+        }
         setModalState(() {
           selectedStartDate = picked;
         });
@@ -2009,6 +2467,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                                 : ImageOptimizer.buildImageWidget(
                                                     selectedPhotoUrl,
                                                     fit: BoxFit.cover,
+                                                    primaryColor: primaryColor,
                                                     placeholder: Center(
                                                       child: Text(
                                                         member.fullName.isNotEmpty ? member.fullName[0].toUpperCase() : 'M',
@@ -2064,8 +2523,8 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                     const SizedBox(width: 8),
                                     OutlinedButton.icon(
                                       style: OutlinedButton.styleFrom(
-                                        foregroundColor: primaryColor,
-                                        side: BorderSide(color: primaryColor.withValues(alpha: 0.5)),
+                                        foregroundColor: Colors.white70,
+                                        side: const BorderSide(color: Color(0xFF283448)),
                                         visualDensity: VisualDensity.compact,
                                       ),
                                       onPressed: () => useSamplePhoto(setModalState),
@@ -2584,65 +3043,72 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                       ),
                                     ),
                                     const SizedBox(height: 6),
-                                    Container(
-                                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFF19202E),
-                                        borderRadius: BorderRadius.circular(12),
-                                        border: Border.all(color: const Color(0xFF283448)),
-                                      ),
-                                      child: DropdownButtonHideUnderline(
-                                        child: DropdownButton<String?>(
-                                          value: selectedBatchId,
-                                          dropdownColor: const Color(0xFF19202E),
-                                          icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
-                                          isExpanded: true,
-                                          items: [
-                                            DropdownMenuItem<String?>(
-                                              value: null,
-                                              child: Row(
-                                                children: [
-                                                  const Icon(Icons.schedule_rounded, size: 16, color: Colors.white38),
-                                                  const SizedBox(width: 8),
-                                                  Text(
-                                                    'No Batch Assigned',
-                                                    style: GoogleFonts.inter(fontSize: 13, color: Colors.white54),
-                                                  ),
-                                                ],
-                                              ),
-                                            ),
-                                            ..._batches.map((b) {
-                                              return DropdownMenuItem<String?>(
-                                                value: b.id,
-                                                child: Row(
-                                                  children: [
-                                                    const Icon(Icons.schedule_rounded, size: 16, color: AppColors.accentCyan),
-                                                    const SizedBox(width: 8),
-                                                    Expanded(
-                                                      child: Text(
-                                                        '${b.name} (${b.time})',
-                                                        style: GoogleFonts.inter(fontSize: 13, color: Colors.white, fontWeight: FontWeight.w600),
-                                                        overflow: TextOverflow.ellipsis,
+                                    Builder(
+                                      builder: (context) {
+                                        final availableBatches = _getAvailableBatches(currentBatchId: member.batchId);
+                                        return Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF19202E),
+                                            borderRadius: BorderRadius.circular(12),
+                                            border: Border.all(color: const Color(0xFF283448)),
+                                          ),
+                                          child: DropdownButtonHideUnderline(
+                                            child: DropdownButton<String?>(
+                                              value: (selectedBatchId != null && availableBatches.any((b) => b.id == selectedBatchId))
+                                                  ? selectedBatchId
+                                                  : null,
+                                              dropdownColor: const Color(0xFF19202E),
+                                              icon: const Icon(Icons.arrow_drop_down, color: Colors.white70),
+                                              isExpanded: true,
+                                              items: [
+                                                DropdownMenuItem<String?>(
+                                                  value: null,
+                                                  child: Row(
+                                                    children: [
+                                                      const Icon(Icons.schedule_rounded, size: 16, color: Colors.white38),
+                                                      const SizedBox(width: 8),
+                                                      Text(
+                                                        'No Batch Assigned',
+                                                        style: GoogleFonts.inter(fontSize: 13, color: Colors.white54),
                                                       ),
-                                                    ),
-                                                  ],
+                                                    ],
+                                                  ),
                                                 ),
-                                              );
-                                            }),
-                                          ],
-                                          onChanged: (val) {
-                                            setModalState(() {
-                                              selectedBatchId = val;
-                                              if (val != null) {
-                                                final match = _batches.where((b) => b.id == val);
-                                                selectedBatchName = match.isNotEmpty ? '${match.first.name} (${match.first.time})' : null;
-                                              } else {
-                                                selectedBatchName = null;
-                                              }
-                                            });
-                                          },
-                                        ),
-                                      ),
+                                                ...availableBatches.map((b) {
+                                                  return DropdownMenuItem<String?>(
+                                                    value: b.id,
+                                                    child: Row(
+                                                      children: [
+                                                        const Icon(Icons.schedule_rounded, size: 16, color: AppColors.accentCyan),
+                                                        const SizedBox(width: 8),
+                                                        Expanded(
+                                                          child: Text(
+                                                            '${b.name} (${b.time})',
+                                                            style: GoogleFonts.inter(fontSize: 13, color: Colors.white, fontWeight: FontWeight.w600),
+                                                            overflow: TextOverflow.ellipsis,
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  );
+                                                }),
+                                              ],
+                                              onChanged: (val) {
+                                                setModalState(() {
+                                                  selectedBatchId = val;
+                                                  if (val != null) {
+                                                    final match = availableBatches.where((b) => b.id == val);
+                                                    selectedBatchName = match.isNotEmpty ? '${match.first.name} (${match.first.time})' : null;
+                                                  } else {
+                                                    selectedBatchName = null;
+                                                  }
+                                                });
+                                              },
+                                            ),
+                                          ),
+                                        );
+                                      },
                                     ),
                                   ],
                                 ),
@@ -2833,7 +3299,14 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                             selectedColor: planModel?.accentColor ?? primaryColor,
                                             backgroundColor: const Color(0xFF19202E),
                                             onSelected: (_) {
-                                              setModalState(() => selectedPlan = planName);
+                                              setModalState(() {
+                                                selectedPlan = planName;
+                                                final now = DateTime.now();
+                                                final todayMidnight = DateTime(now.year, now.month, now.day);
+                                                if (selectedStartDate.isAfter(todayMidnight)) {
+                                                  selectedStartDate = todayMidnight;
+                                                }
+                                              });
                                             },
                                           );
                                         }).toList(),
@@ -2847,7 +3320,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                     builder: (context) {
                                       final planModel = _membershipPlans.where((p) => p.name == selectedPlan).firstOrNull;
                                       final durationDays = planModel?.durationDays ?? (selectedPlan.contains('Annual') ? 365 : 30);
-                                      final calculatedEndDate = selectedStartDate.add(Duration(days: durationDays));
+                                      final calculatedEndDate = selectedStartDate.add(Duration(days: durationDays > 0 ? durationDays - 1 : 0));
                                       final isExpiredDate = calculatedEndDate.isBefore(DateTime.now());
 
                                       return Container(
@@ -3173,16 +3646,26 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                             isLoading: isSubmitting,
                             onPressed: () async {
                               if (!formKey.currentState!.validate()) return;
+                              final now = DateTime.now();
+                              final todayMidnight = DateTime(now.year, now.month, now.day);
+                              if (selectedStartDate.isAfter(todayMidnight)) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Plan start date cannot be in the future.'),
+                                    backgroundColor: AppColors.error,
+                                  ),
+                                );
+                                return;
+                              }
                               setModalState(() => isSubmitting = true);
 
                               final planModel = _membershipPlans.where((p) => p.name == selectedPlan).firstOrNull;
-                              final duration = isLifetimeFree
-                                  ? const Duration(days: 36500)
+                              final durationDays = isLifetimeFree
+                                  ? 36500
                                   : (planModel != null
-                                      ? Duration(days: planModel.durationDays)
-                                      : (selectedPlan.contains('Annual')
-                                          ? const Duration(days: 365)
-                                          : const Duration(days: 30)));
+                                      ? planModel.durationDays
+                                      : (selectedPlan.contains('Annual') ? 365 : 30));
+                              final duration = Duration(days: durationDays > 0 ? durationDays - 1 : 0);
 
                               final emgName = emergencyNameCtrl.text.trim();
                               final emgPhone = emergencyPhoneCtrl.text.trim();
@@ -3216,6 +3699,33 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                 startDate: selectedStartDate,
                                 expiryDate: isLifetimeFree ? DateTime(2099, 12, 31) : selectedStartDate.add(duration),
                               );
+
+                              if (selectedBatchId != null && selectedBatchId != member.batchId) {
+                                final matchIdx = _batches.indexWhere((b) => b.id == selectedBatchId);
+                                if (matchIdx != -1) {
+                                  final batch = _batches[matchIdx];
+                                  final allMembers = _members.isNotEmpty ? _members : widget.authController.members;
+                                  final linkedIds = <String>{
+                                    ...batch.memberIds,
+                                    ...allMembers.where((m) => m.batchId == batch.id).map((m) => m.id),
+                                  };
+                                  final count = linkedIds.isNotEmpty ? linkedIds.length : batch.memberIds.length;
+                                  if (batch.limit > 0 && (batch.isFull || count >= batch.limit)) {
+                                    setModalState(() => isSubmitting = false);
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(
+                                          'Selected batch "${batch.name}" has reached its member limit ($count/${batch.limit}). Please choose another batch.',
+                                          style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                                        ),
+                                        backgroundColor: AppColors.error,
+                                        behavior: SnackBarBehavior.floating,
+                                      ),
+                                    );
+                                    return;
+                                  }
+                                }
+                              }
 
                               final navigator = Navigator.of(ctx);
                               final messenger = ScaffoldMessenger.of(context);
@@ -3452,7 +3962,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                     ElevatedButton.icon(
                                       style: ElevatedButton.styleFrom(
                                         backgroundColor: primaryColor,
-                                        foregroundColor: Colors.black,
+                                        foregroundColor: Colors.white,
                                         padding: const EdgeInsets.symmetric(
                                           horizontal: 12,
                                           vertical: 6,
@@ -3572,14 +4082,14 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                     // Tab 1: Overview & Live Check-in Stream
                     _buildOverviewTab(primaryColor, tenant),
 
-                    // Tab 2: Members Directory
-                    _buildMembersTab(primaryColor),
-
-                    // Tab 3: Batches & Schedules
+                    // Tab 2: Batches & Schedules
                     _buildBatchesTab(primaryColor),
 
-                    // Tab 4: Membership Plans & Planners
+                    // Tab 3: Membership Plans & Planners
                     _buildPlansTab(primaryColor),
+
+                    // Tab 4: Members Directory
+                    _buildMembersTab(primaryColor),
 
                     // Tab 5: Expenses & Outflow Ledger
                     _buildExpensesTab(primaryColor),
@@ -3587,7 +4097,10 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                     // Tab 6: Team & Staff
                     _buildTeamTab(primaryColor),
 
-                    // Tab 7: Facility & Subscription Plan Details
+                    // Tab 7: Gallery (Photos & Videos)
+                    _buildGalleryTab(primaryColor),
+
+                    // Tab 8: Facility & Subscription Plan Details
                     _buildFacilityTab(primaryColor, tenant),
                   ],
                 ),
@@ -3596,48 +4109,114 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
           ),
         ),
       ),
-      floatingActionButton: _selectedTabIndex == 1
-          ? FloatingActionButton(
-              backgroundColor: primaryColor,
-              foregroundColor: Colors.black,
-              elevation: 4,
-              child: const Icon(Icons.person_add_rounded),
-              onPressed: () => _showAddMemberDialog(primaryColor),
-            )
-          : (_selectedTabIndex == 2
-              ? FloatingActionButton(
-                  backgroundColor: primaryColor,
-                  foregroundColor: Colors.black,
-                  elevation: 4,
-                  child: const Icon(Icons.add_alarm_rounded),
-                  onPressed: () => _showAddEditBatchDialog(primaryColor: primaryColor),
-                )
-              : (_selectedTabIndex == 3
-                  ? FloatingActionButton(
-                      backgroundColor: primaryColor,
-                      foregroundColor: Colors.black,
-                      elevation: 4,
-                      child: const Icon(Icons.add_card_rounded),
-                      onPressed: () => _showAddOrEditPlanDialog(primaryColor: primaryColor),
-                    )
-                  : (_selectedTabIndex == 4
-                      ? FloatingActionButton(
-                          backgroundColor: AppColors.accentViolet,
-                          foregroundColor: Colors.white,
-                          elevation: 4,
-                          child: const Icon(Icons.receipt_long_rounded),
-                          onPressed: () => _showAddOrEditExpenseDialog(primaryColor: primaryColor),
-                        )
-                      : (_selectedTabIndex == 5
-                          ? FloatingActionButton(
-                              backgroundColor: primaryColor,
-                              foregroundColor: Colors.black,
-                              elevation: 4,
-                              child: const Icon(Icons.person_add_alt_1_rounded),
-                              onPressed: () => _showAddTeamMemberDialog(primaryColor),
-                            )
-                          : null)))),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      floatingActionButton: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            // Left FAB: QR Code Scanner for Fast Member Check-In (All tabs)
+            FloatingActionButton(
+              heroTag: 'qr_check_in_scanner_fab',
+              backgroundColor: const Color(0xFF162032),
+              foregroundColor: primaryColor,
+              elevation: 6,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+                side: BorderSide(color: primaryColor.withValues(alpha: 0.6), width: 1.5),
+              ),
+              tooltip: 'Scan Member QR Pass',
+              onPressed: () => _openQrCheckInScanner(primaryColor, tenant),
+              child: const Icon(Icons.qr_code_scanner_rounded, size: 26),
+            ),
+
+            // Right FAB: Tab-Specific Action Button
+            _buildTabContextFab(primaryColor),
+          ],
+        ),
+      ),
     );
+  }
+
+  Future<void> _openQrCheckInScanner(Color primaryColor, GymTenantModel? tenant) async {
+    final checkedIn = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => QrCheckInScannerScreen(
+          authController: widget.authController,
+          tenant: tenant,
+          primaryColor: primaryColor,
+        ),
+      ),
+    );
+
+    if (checkedIn == true && mounted) {
+      setState(() {
+        _members = List.from(widget.authController.members);
+        _recentCheckIns = List.from(widget.authController.checkIns);
+      });
+    }
+  }
+
+  Widget _buildTabContextFab(Color primaryColor) {
+    if (_selectedTabIndex == 1) {
+      return FloatingActionButton(
+        heroTag: 'add_batch_fab',
+        backgroundColor: primaryColor,
+        foregroundColor: Colors.white,
+        elevation: 4,
+        onPressed: () => _showAddEditBatchDialog(primaryColor: primaryColor),
+        child: const Icon(Icons.add_alarm_rounded),
+      );
+    } else if (_selectedTabIndex == 2) {
+      return FloatingActionButton(
+        heroTag: 'add_plan_fab',
+        backgroundColor: primaryColor,
+        foregroundColor: Colors.white,
+        elevation: 4,
+        onPressed: () => _showAddOrEditPlanDialog(primaryColor: primaryColor),
+        child: const Icon(Icons.add_card_rounded),
+      );
+    } else if (_selectedTabIndex == 3) {
+      return FloatingActionButton(
+        heroTag: 'add_member_fab',
+        backgroundColor: primaryColor,
+        foregroundColor: Colors.white,
+        elevation: 4,
+        onPressed: () => _showAddMemberDialog(primaryColor),
+        child: const Icon(Icons.person_add_rounded),
+      );
+    } else if (_selectedTabIndex == 4) {
+      return FloatingActionButton(
+        heroTag: 'add_expense_fab',
+        backgroundColor: AppColors.accentViolet,
+        foregroundColor: Colors.white,
+        elevation: 4,
+        onPressed: () => _showAddOrEditExpenseDialog(primaryColor: primaryColor),
+        child: const Icon(Icons.receipt_long_rounded),
+      );
+    } else if (_selectedTabIndex == 5) {
+      return FloatingActionButton(
+        heroTag: 'add_team_fab',
+        backgroundColor: primaryColor,
+        foregroundColor: Colors.white,
+        elevation: 4,
+        onPressed: () => _showAddTeamMemberDialog(primaryColor),
+        child: const Icon(Icons.person_add_alt_1_rounded),
+      );
+    } else if (_selectedTabIndex == 6) {
+      return FloatingActionButton(
+        heroTag: 'add_gallery_fab',
+        backgroundColor: primaryColor,
+        foregroundColor: Colors.white,
+        elevation: 4,
+        tooltip: 'Upload Media',
+        onPressed: () => _showUploadGalleryDialog(primaryColor),
+        child: const Icon(Icons.add_photo_alternate_rounded),
+      );
+    }
+    return const SizedBox.shrink();
   }
 
   Widget _buildGymHeader({
@@ -3690,6 +4269,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   child: ImageOptimizer.buildImageWidget(
                     tenant?.logoUrl,
                     fit: BoxFit.cover,
+                    primaryColor: primaryColor,
                     placeholder: Center(
                       child: Text(
                         gymName.isNotEmpty ? gymName[0].toUpperCase() : 'G',
@@ -3802,6 +4382,57 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   ],
                 ),
               ),
+              // Notification Bell Button with Realtime Badge
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A2333),
+                      shape: BoxShape.circle,
+                      border: Border.all(color: const Color(0xFF28364D)),
+                    ),
+                    child: IconButton(
+                      icon: Icon(
+                        _unreadNotificationCount > 0
+                            ? Icons.notifications_active_rounded
+                            : Icons.notifications_none_rounded,
+                        color: _unreadNotificationCount > 0
+                            ? primaryColor
+                            : AppColors.textSecondaryDark,
+                        size: 20,
+                      ),
+                      tooltip: 'Platform Notifications',
+                      onPressed: _openNotificationCenter,
+                    ),
+                  ),
+                  if (_unreadNotificationCount > 0)
+                    Positioned(
+                      top: -2,
+                      right: -2,
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: primaryColor,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: const Color(0xFF101725), width: 1.5),
+                        ),
+                        constraints: const BoxConstraints(minWidth: 18, minHeight: 18),
+                        child: Center(
+                          child: Text(
+                            '$_unreadNotificationCount',
+                            style: GoogleFonts.inter(
+                              fontSize: 9.5,
+                              fontWeight: FontWeight.w900,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(width: 8),
               Container(
                 decoration: BoxDecoration(
                   color: const Color(0xFF1A2333),
@@ -3947,11 +4578,12 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         ),
         indicatorSize: TabBarIndicatorSize.tab,
         dividerColor: Colors.transparent,
-        labelColor: Colors.black,
+        labelColor: Colors.white,
         unselectedLabelColor: AppColors.textMutedDark,
         labelStyle: GoogleFonts.poppins(
           fontSize: 11.5,
           fontWeight: FontWeight.w700,
+          color: Colors.white,
         ),
         unselectedLabelStyle: GoogleFonts.poppins(
           fontSize: 11.5,
@@ -3959,11 +4591,12 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         ),
         tabs: const [
           Tab(text: 'Overview', icon: Icon(Icons.dashboard_rounded, size: 17)),
-          Tab(text: 'Members', icon: Icon(Icons.people_alt_rounded, size: 17)),
           Tab(text: 'Batches', icon: Icon(Icons.schedule_rounded, size: 17)),
           Tab(text: 'Plans', icon: Icon(Icons.card_membership_rounded, size: 17)),
+          Tab(text: 'Members', icon: Icon(Icons.people_alt_rounded, size: 17)),
           Tab(text: 'Expenses', icon: Icon(Icons.receipt_long_rounded, size: 17)),
           Tab(text: 'Team', icon: Icon(Icons.groups_2_rounded, size: 17)),
+          Tab(text: 'Gallery', icon: Icon(Icons.photo_library_rounded, size: 17)),
           Tab(text: 'Facility', icon: Icon(Icons.store_rounded, size: 17)),
         ],
       ),
@@ -4665,7 +5298,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                           style: GoogleFonts.inter(
                             fontSize: 10.5,
                             fontWeight: isSel ? FontWeight.w700 : FontWeight.w500,
-                            color: isSel ? Colors.black : AppColors.textSecondaryDark,
+                            color: isSel ? Colors.white : AppColors.textSecondaryDark,
                           ),
                         ),
                       ),
@@ -5191,7 +5824,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
   }
 
-  // ──────── TAB 2: MEMBERS DIRECTORY ────────
+  // ──────── TAB 4: MEMBERS DIRECTORY ────────
   Widget _buildMembersTab(Color primaryColor) {
     final query = _memberSearchQuery.trim().toLowerCase();
     final filtered = _members.where((m) {
@@ -5199,9 +5832,21 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
           m.phone.contains(query) ||
           m.membershipPlan.toLowerCase().contains(query);
       if (_selectedMemberFilter == 'Expiring') {
-        return matchesQuery && m.isExpiringSoon;
+        if (!m.isActive || m.isExpired || m.isLifetimeFree) return false;
+        if (!m.isExpiringSoon) return false;
+        int maxDays = 7;
+        if (_selectedExpiringFilter == '1D') {
+          maxDays = 1;
+        } else if (_selectedExpiringFilter == '3D') {
+          maxDays = 3;
+        } else if (_selectedExpiringFilter == '7D') {
+          maxDays = 7;
+        }
+        return matchesQuery && m.daysRemaining <= maxDays;
       } else if (_selectedMemberFilter == 'Active') {
         return matchesQuery && m.isActive;
+      } else if (_selectedMemberFilter == 'Inactive') {
+        return matchesQuery && !m.isActive;
       }
       return matchesQuery;
     }).toList();
@@ -5226,7 +5871,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: Row(
-                  children: ['All', 'Active', 'Expiring'].map((filter) {
+                  children: ['All', 'Active', 'Expiring', 'Inactive'].map((filter) {
                     final isSelected = _selectedMemberFilter == filter;
                     return Padding(
                       padding: const EdgeInsets.only(right: 8),
@@ -5236,11 +5881,12 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                           style: GoogleFonts.inter(
                             fontSize: 12,
                             fontWeight: FontWeight.w600,
-                            color: isSelected ? Colors.black : Colors.white70,
+                            color: isSelected ? Colors.white : Colors.white70,
                           ),
                         ),
                         selected: isSelected,
                         selectedColor: primaryColor,
+                        checkmarkColor: Colors.white,
                         backgroundColor: const Color(0xFF19202E),
                         onSelected: (_) => _fetchMembersWithServerFilter(filter),
                       ),
@@ -5248,6 +5894,79 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   }).toList(),
                 ),
               ),
+
+              // Sub-filters for Expiring Members (1D, 3D, 7D - Days)
+              if (_selectedMemberFilter == 'Expiring') ...[
+                const SizedBox(height: 8),
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: AppColors.accentAmber.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: AppColors.accentAmber.withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.timer_outlined,
+                              size: 13,
+                              color: AppColors.accentAmber,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              'Expiring in (D = Days):',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.accentAmber,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ...['1D', '3D', '7D'].map((subFilter) {
+                        final isSubSelected = _selectedExpiringFilter == subFilter;
+                        return Padding(
+                          padding: const EdgeInsets.only(right: 6),
+                          child: ChoiceChip(
+                            label: Text(
+                              subFilter,
+                              style: GoogleFonts.inter(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w700,
+                                color: isSubSelected ? Colors.white : Colors.white70,
+                              ),
+                            ),
+                            selected: isSubSelected,
+                            selectedColor: AppColors.accentAmber,
+                            checkmarkColor: Colors.white,
+                            backgroundColor: const Color(0xFF19202E),
+                            side: BorderSide(
+                              color: isSubSelected
+                                  ? AppColors.accentAmber
+                                  : const Color(0xFF283448),
+                            ),
+                            visualDensity: VisualDensity.compact,
+                            onSelected: (selected) {
+                              if (selected) {
+                                setState(() => _selectedExpiringFilter = subFilter);
+                              }
+                            },
+                          ),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+              ],
             ],
           ),
         ),
@@ -5290,7 +6009,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                             ElevatedButton.icon(
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: primaryColor,
-                                foregroundColor: Colors.black,
+                                foregroundColor: Colors.white,
                                 padding: const EdgeInsets.symmetric(
                                     horizontal: 16, vertical: 10),
                                 shape: RoundedRectangleBorder(
@@ -5342,7 +6061,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                     ElevatedButton.icon(
                                       style: ElevatedButton.styleFrom(
                                         backgroundColor: primaryColor,
-                                        foregroundColor: Colors.black,
+                                        foregroundColor: Colors.white,
                                         padding: const EdgeInsets.symmetric(
                                             horizontal: 14, vertical: 8),
                                         shape: RoundedRectangleBorder(
@@ -5355,7 +6074,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                               height: 14,
                                               child: CircularProgressIndicator(
                                                 strokeWidth: 2,
-                                                color: Colors.black,
+                                                color: Colors.white,
                                               ),
                                             )
                                           : const Icon(Icons.arrow_forward_rounded, size: 16),
@@ -5381,545 +6100,769 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   }
 
   Widget _buildMemberCard(GymMemberRecord member, Color primaryColor) {
+    final isExpanded = _expandedMemberId == member.id;
     final isExp = member.isExpiringSoon;
     final isExpired = member.isExpired;
-    final statusColor = isExpired
-        ? AppColors.error
-        : (isExp ? AppColors.accentAmber : AppColors.success);
+    final statusColor = !member.isActive
+        ? Colors.white54
+        : (isExpired
+            ? AppColors.error
+            : (isExp ? AppColors.accentAmber : AppColors.success));
 
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 240),
+      curve: Curves.easeInOutCubic,
       margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
+        gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: [
-            Color(0xFF141D2B),
-            Color(0xFF0F1522),
-          ],
+          colors: isExpanded
+              ? [const Color(0xFF162030), const Color(0xFF101726)]
+              : [const Color(0xFF131B27), const Color(0xFF0F1522)],
         ),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
-          color: isExpired
-              ? AppColors.error.withValues(alpha: 0.6)
-              : (isExp
-                  ? AppColors.accentAmber.withValues(alpha: 0.6)
-                  : const Color(0xFF223047)),
-          width: (isExp || isExpired) ? 1.4 : 1,
+          color: isExpanded
+              ? primaryColor.withValues(alpha: 0.6)
+              : (!member.isActive
+                  ? const Color(0xFF223047)
+                  : (isExpired
+                      ? AppColors.error.withValues(alpha: 0.6)
+                      : (isExp
+                          ? AppColors.accentAmber.withValues(alpha: 0.6)
+                          : const Color(0xFF223047)))),
+          width: isExpanded ? 1.5 : ((member.isActive && (isExp || isExpired)) ? 1.4 : 1),
         ),
         boxShadow: [
           BoxShadow(
-            color: (isExpired ? AppColors.error : (isExp ? AppColors.accentAmber : Colors.black))
-                .withValues(alpha: (isExp || isExpired) ? 0.15 : 0.2),
-            blurRadius: 10,
+            color: (isExpanded
+                    ? primaryColor
+                    : (!member.isActive
+                        ? Colors.black
+                        : (isExpired ? AppColors.error : (isExp ? AppColors.accentAmber : Colors.black))))
+                .withValues(alpha: isExpanded ? 0.18 : ((member.isActive && (isExp || isExpired)) ? 0.15 : 0.2)),
+            blurRadius: isExpanded ? 14 : 10,
             offset: const Offset(0, 4),
           ),
         ],
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              // Member Profile Photo or Avatar
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: const Color(0xFF192231),
-                  border: Border.all(
-                    color: primaryColor.withValues(alpha: 0.7),
-                    width: 1.5,
-                  ),
-                ),
-                child: ClipOval(
-                  child: ImageOptimizer.buildImageWidget(
-                    member.photoUrl,
-                    fit: BoxFit.cover,
-                    placeholder: Center(
-                      child: Text(
-                        member.fullName.isNotEmpty ? member.fullName[0].toUpperCase() : 'M',
-                        style: GoogleFonts.poppins(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w800,
-                          color: primaryColor,
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: () {
+            setState(() {
+              if (_expandedMemberId == member.id) {
+                _expandedMemberId = null;
+              } else {
+                _expandedMemberId = member.id;
+              }
+            });
+          },
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // ── HEADER: Avatar + Name/Phone + Status Pill + I-Card + Expand Chevron ──
+                Row(
+                  children: [
+                    // Member Avatar with status indicator ring
+                    Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: const Color(0xFF192231),
+                            border: Border.all(
+                              color: (member.isActive && (isExp || isExpired))
+                                  ? statusColor
+                                  : primaryColor.withValues(alpha: 0.7),
+                              width: 1.5,
+                            ),
+                          ),
+                            child: ClipOval(
+                              child: ImageOptimizer.buildImageWidget(
+                                member.photoUrl,
+                                fit: BoxFit.cover,
+                                primaryColor: primaryColor,
+                                placeholder: Center(
+                                  child: Text(
+                                    member.fullName.isNotEmpty ? member.fullName[0].toUpperCase() : 'M',
+                                    style: GoogleFonts.poppins(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w800,
+                                      color: primaryColor,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            bottom: 0,
+                            right: 0,
+                            child: Container(
+                              width: 12,
+                              height: 12,
+                              decoration: BoxDecoration(
+                                color: member.isLifetimeFree
+                                    ? AppColors.accentViolet
+                                    : (!member.isActive ? Colors.white38 : statusColor),
+                                shape: BoxShape.circle,
+                                border: Border.all(color: const Color(0xFF131B27), width: 2),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(width: 10),
+                      // Full Name & Demographics + Phone
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    member.fullName,
+                                    style: GoogleFonts.poppins(
+                                      fontSize: 14.5,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white10,
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(
+                                    member.age != null ? '${member.gender} • ${member.age}y' : member.gender,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 9.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 2),
+                            Row(
+                              children: [
+                                const Icon(Icons.phone_rounded, size: 11, color: AppColors.textSecondaryDark),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Text(
+                                    member.phone.isNotEmpty ? member.phone : member.email,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 11,
+                                      color: AppColors.textSecondaryDark,
+                                    ),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
                         ),
                       ),
-                    ),
+                      // Status Pill + I-Card + Expand Chevron
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3.5),
+                            decoration: BoxDecoration(
+                              color: member.isLifetimeFree
+                                  ? AppColors.accentViolet.withValues(alpha: 0.2)
+                                  : (!member.isActive
+                                      ? Colors.white10
+                                      : statusColor.withValues(alpha: 0.18)),
+                              borderRadius: BorderRadius.circular(7),
+                              border: Border.all(
+                                color: member.isLifetimeFree
+                                    ? AppColors.accentViolet.withValues(alpha: 0.5)
+                                    : (!member.isActive
+                                        ? Colors.white24
+                                        : statusColor.withValues(alpha: 0.4)),
+                              ),
+                            ),
+                            child: Text(
+                              member.isLifetimeFree
+                                  ? '♾️ Lifetime Free'
+                                  : (!member.isActive
+                                      ? 'Inactive'
+                                      : (isExpired
+                                          ? 'Expired'
+                                          : (isExp
+                                              ? (member.daysRemaining == 0
+                                                  ? 'Expiring Today'
+                                                  : 'Expiring (${member.daysRemaining}d)')
+                                              : 'Active (${member.daysRemaining}d)'))),
+                              style: GoogleFonts.inter(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                                color: member.isLifetimeFree
+                                    ? AppColors.accentViolet
+                                    : (!member.isActive ? Colors.white60 : statusColor),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 2),
+                          IconButton(
+                            icon: const Icon(Icons.badge_outlined, color: Colors.white70, size: 20),
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                            tooltip: 'Generate I-Card',
+                            onPressed: () {
+                              final tenant = _resolveCurrentTenant();
+                              ICardGenerator.generateAndPreviewICard(
+                                member: member,
+                                tenant: tenant,
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 2),
+                          AnimatedRotation(
+                            turns: isExpanded ? 0.5 : 0.0,
+                            duration: const Duration(milliseconds: 220),
+                            child: Container(
+                              padding: const EdgeInsets.all(4),
+                              decoration: BoxDecoration(
+                                color: isExpanded
+                                    ? primaryColor.withValues(alpha: 0.2)
+                                    : Colors.white.withValues(alpha: 0.06),
+                                shape: BoxShape.circle,
+                              ),
+                              child: Icon(
+                                Icons.keyboard_arrow_down_rounded,
+                                size: 18,
+                                color: isExpanded ? primaryColor : Colors.white60,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
+
+                  // ── IMPORTANT COLLAPSED INFO STRIP: Plan & Batch Strip ──
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF101724),
+                      borderRadius: BorderRadius.circular(9),
+                      border: Border.all(color: const Color(0xFF1D283A)),
+                    ),
+                    child: Row(
                       children: [
+                        Icon(
+                          member.isLifetimeFree
+                              ? Icons.all_inclusive_rounded
+                              : Icons.workspace_premium_rounded,
+                          size: 13,
+                          color: member.isLifetimeFree ? AppColors.accentViolet : primaryColor,
+                        ),
+                        const SizedBox(width: 5),
                         Flexible(
                           child: Text(
-                            member.fullName,
-                            style: GoogleFonts.poppins(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w700,
+                            member.isLifetimeFree ? 'Plan: VIP Lifetime Free' : 'Plan: ${member.membershipPlan}',
+                            style: GoogleFonts.inter(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
                               color: Colors.white,
                             ),
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                        const SizedBox(width: 6),
-                        // Gender & Age Badge
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1.5),
-                          decoration: BoxDecoration(
-                            color: Colors.white10,
-                            borderRadius: BorderRadius.circular(6),
+                        if (member.hasDiscount) ...[
+                          const SizedBox(width: 5),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: AppColors.accentEmerald.withValues(alpha: 0.18),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              '🏷️ ${member.formattedDiscount}',
+                              style: GoogleFonts.inter(
+                                fontSize: 9,
+                                fontWeight: FontWeight.w700,
+                                color: AppColors.accentEmerald,
+                              ),
+                            ),
                           ),
+                        ],
+                        const SizedBox(width: 8),
+                        Container(
+                          width: 1,
+                          height: 12,
+                          color: Colors.white12,
+                        ),
+                        const SizedBox(width: 8),
+                        Icon(
+                          Icons.schedule_rounded,
+                          size: 12,
+                          color: member.batchName != null && member.batchName!.isNotEmpty
+                              ? AppColors.accentCyan
+                              : Colors.white38,
+                        ),
+                        const SizedBox(width: 4),
+                        Flexible(
                           child: Text(
-                            member.age != null ? '${member.gender} • ${member.age}y' : member.gender,
+                            member.batchName != null && member.batchName!.isNotEmpty
+                                ? 'Batch: ${member.batchName}'
+                                : 'Batch: Unassigned',
                             style: GoogleFonts.inter(
-                              fontSize: 10,
+                              fontSize: 10.5,
                               fontWeight: FontWeight.w600,
-                              color: Colors.white70,
+                              color: member.batchName != null && member.batchName!.isNotEmpty
+                                  ? AppColors.accentCyan
+                                  : Colors.white38,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  // ── EXPANDED DETAILS (Only revealed when isExpanded) ──
+                  if (isExpanded) ...[
+                    const SizedBox(height: 10),
+                    const Divider(color: Colors.white12, height: 1),
+                    const SizedBox(height: 8),
+
+                    // Plan Validity Schedule Display
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: isExpired
+                            ? AppColors.error.withValues(alpha: 0.1)
+                            : const Color(0xFF101724),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                          color: isExpired
+                              ? AppColors.error.withValues(alpha: 0.3)
+                              : const Color(0xFF1D283A),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            member.isLifetimeFree
+                                ? Icons.all_inclusive_rounded
+                                : (isExpired ? Icons.event_busy_rounded : Icons.date_range_rounded),
+                            size: 13,
+                            color: member.isLifetimeFree
+                                ? AppColors.accentViolet
+                                : (isExpired ? AppColors.error : AppColors.accentCyan),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              member.isLifetimeFree
+                                  ? 'Validity: Lifetime Access (Never Expires)'
+                                  : (isExpired
+                                      ? 'Expired on ${DateFormat('dd MMM yyyy').format(member.expiryDate)} (Started: ${DateFormat('dd MMM yyyy').format(member.startDate)})'
+                                      : 'Plan Schedule: ${DateFormat('dd MMM yyyy').format(member.startDate)} → ${DateFormat('dd MMM yyyy').format(member.expiryDate)}'),
+                              style: GoogleFonts.inter(
+                                fontSize: 10.5,
+                                fontWeight: FontWeight.w600,
+                                color: member.isLifetimeFree
+                                    ? AppColors.accentViolet
+                                    : (isExpired ? AppColors.error : AppColors.textSecondaryDark),
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    // Email Display (if available and different from phone)
+                    if (member.email.isNotEmpty && member.email != member.phone) ...[
+                      const SizedBox(height: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF101724),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: const Color(0xFF1D283A)),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.email_outlined, size: 13, color: AppColors.textSecondaryDark),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                member.email,
+                                style: GoogleFonts.inter(
+                                  fontSize: 10.5,
+                                  color: AppColors.textSecondaryDark,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+
+                    // Fitness Goal & Physical Metrics (Weight, Height, BMI)
+                    if (member.goal != null || member.weight != null || member.height != null) ...[
+                      const SizedBox(height: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: primaryColor.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: primaryColor.withValues(alpha: 0.25)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.track_changes_rounded, size: 14, color: primaryColor),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                'Goal: ${member.formattedGoal}  •  ${member.formattedWeight}  •  ${member.formattedHeight}${member.bmi != null ? '  •  BMI: ${member.formattedBmi}' : ''}',
+                                style: GoogleFonts.inter(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: Colors.white,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+
+                    // Optional Emergency Contact Section
+                    if (member.hasEmergencyContact) ...[
+                      const SizedBox(height: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: AppColors.accentAmber.withValues(alpha: 0.08),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: AppColors.accentAmber.withValues(alpha: 0.25)),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.emergency_outlined, size: 14, color: AppColors.accentAmber),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                'Emergency: ${member.emergencyContactName ?? 'Contact'} (${member.emergencyContactRelation ?? 'Relation'}) • ${member.emergencyPhone ?? ''}',
+                                style: GoogleFonts.inter(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: const Color(0xFFFDE68A),
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+
+                    // Optional Address Display
+                    if (member.address.isNotEmpty) ...[
+                      const SizedBox(height: 6),
+                      Row(
+                        children: [
+                          const Icon(Icons.location_on_outlined, size: 12, color: AppColors.textSecondaryDark),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Text(
+                              member.address,
+                              style: GoogleFonts.inter(
+                                fontSize: 10.5,
+                                color: AppColors.textSecondaryDark,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+
+                    const SizedBox(height: 10),
+                    const Divider(color: Colors.white10, height: 1),
+                    const SizedBox(height: 8),
+
+                    // Check-Ins summary row
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(
+                              Icons.event_available_rounded,
+                              size: 13,
+                              color: AppColors.textSecondaryDark,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              'Total Check-Ins: ${member.totalCheckIns}',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: AppColors.textSecondaryDark,
+                              ),
+                            ),
+                          ],
+                        ),
+                        if (member.lastCheckIn != null)
+                          Text(
+                            'Last: ${DateFormat('dd MMM').format(member.lastCheckIn!)}',
+                            style: GoogleFonts.inter(
+                              fontSize: 10.5,
+                              color: AppColors.textSecondaryDark,
+                            ),
+                          ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    // Action Buttons: Quick Check-In, Edit & Status Toggle
+                    Row(
+                      children: [
+                        Expanded(
+                          child: InkWell(
+                            onTap: () async {
+                              final tenantId = member.tenantId ??
+                                  widget.authController.currentGymTenant?.id ??
+                                  widget.authController.currentUser?.tenantId ??
+                                  'default_tenant';
+                              await widget.authController.recordMemberCheckIn(
+                                tenantId: tenantId,
+                                memberId: member.id,
+                                memberName: member.fullName,
+                                planName: member.membershipPlan,
+                                method: 'Manual Pass',
+                              );
+                              if (mounted) {
+                                setState(() {
+                                  _members = List.from(widget.authController.members);
+                                  _recentCheckIns = List.from(widget.authController.checkIns);
+                                });
+                              }
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                      'Checked in ${member.fullName} successfully!',
+                                      style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                                    ),
+                                    backgroundColor: AppColors.success,
+                                    behavior: SnackBarBehavior.floating,
+                                  ),
+                                );
+                              }
+                            },
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: AppColors.accentCyan.withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: AppColors.accentCyan.withValues(alpha: 0.35)),
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.qr_code_scanner_rounded, size: 13, color: AppColors.accentCyan),
+                                  const SizedBox(width: 4),
+                                  Flexible(
+                                    child: Text(
+                                      'Check In',
+                                      style: GoogleFonts.inter(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w700,
+                                        color: AppColors.accentCyan,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: InkWell(
+                            onTap: () => _showEditMemberDialog(member, primaryColor),
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: Colors.white10,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Colors.white24),
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.edit_outlined, size: 13, color: Colors.white70),
+                                  const SizedBox(width: 4),
+                                  Flexible(
+                                    child: Text(
+                                      'Edit',
+                                      style: GoogleFonts.inter(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: Colors.white70,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: InkWell(
+                            onTap: () => _showToggleMemberStatusDialog(member),
+                            borderRadius: BorderRadius.circular(8),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 7),
+                              decoration: BoxDecoration(
+                                color: member.isActive
+                                    ? Colors.orangeAccent.withValues(alpha: 0.12)
+                                    : AppColors.success.withValues(alpha: 0.12),
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: member.isActive
+                                      ? Colors.orangeAccent.withValues(alpha: 0.35)
+                                      : AppColors.success.withValues(alpha: 0.35),
+                                ),
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    member.isActive
+                                        ? Icons.pause_circle_outline_rounded
+                                        : Icons.play_circle_outline_rounded,
+                                    size: 13,
+                                    color: member.isActive ? Colors.orangeAccent : AppColors.success,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Flexible(
+                                    child: Text(
+                                      member.isActive ? 'Set Inactive' : 'Set Active',
+                                      style: GoogleFonts.inter(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: member.isActive ? Colors.orangeAccent : AppColors.success,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 2),
-                    Text(
-                      member.email.isNotEmpty ? member.email : member.phone,
-                      style: GoogleFonts.inter(
-                        fontSize: 11.5,
-                        color: AppColors.textSecondaryDark,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
                   ],
-                ),
-              ),
-              // Expiry / Active Status Pill
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: member.isLifetimeFree
-                      ? AppColors.accentViolet.withValues(alpha: 0.2)
-                      : statusColor.withValues(alpha: 0.18),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: member.isLifetimeFree
-                        ? AppColors.accentViolet.withValues(alpha: 0.5)
-                        : statusColor.withValues(alpha: 0.4),
-                  ),
-                ),
-                child: Text(
-                  member.isLifetimeFree
-                      ? '♾️ Lifetime Free'
-                      : (isExpired
-                          ? 'Expired'
-                          : (isExp
-                              ? 'Expiring (${member.daysRemaining}d)'
-                              : 'Active (${member.daysRemaining}d)')),
-                  style: GoogleFonts.inter(
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.w700,
-                    color: member.isLifetimeFree ? AppColors.accentViolet : statusColor,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-
-          // Plan & Phone Information Card
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF101724),
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFF1D283A)),
-            ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                      member.isLifetimeFree ? Icons.all_inclusive_rounded : Icons.workspace_premium_rounded,
-                      size: 14,
-                      color: member.isLifetimeFree ? AppColors.accentViolet : primaryColor,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      member.isLifetimeFree ? 'Plan: VIP Lifetime Free' : 'Plan: ${member.membershipPlan}',
-                      style: GoogleFonts.inter(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white,
-                      ),
-                    ),
-                    if (member.hasDiscount) ...[
-                      const SizedBox(width: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
-                        decoration: BoxDecoration(
-                          color: AppColors.accentEmerald.withValues(alpha: 0.18),
-                          borderRadius: BorderRadius.circular(5),
-                          border: Border.all(color: AppColors.accentEmerald.withValues(alpha: 0.4)),
-                        ),
-                        child: Text(
-                          '🏷️ ${member.formattedDiscount}',
-                          style: GoogleFonts.inter(
-                            fontSize: 9.5,
-                            fontWeight: FontWeight.w700,
-                            color: AppColors.accentEmerald,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-                Row(
-                  children: [
-                    const Icon(Icons.phone_rounded, size: 13, color: AppColors.textSecondaryDark),
-                    const SizedBox(width: 4),
-                    Text(
-                      member.phone,
-                      style: GoogleFonts.inter(
-                        fontSize: 11,
-                        color: AppColors.textSecondaryDark,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-
-          // Plan Validity Schedule Display
-          const SizedBox(height: 6),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: isExpired
-                  ? AppColors.error.withValues(alpha: 0.1)
-                  : const Color(0xFF101724),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: isExpired
-                    ? AppColors.error.withValues(alpha: 0.3)
-                    : const Color(0xFF1D283A),
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  member.isLifetimeFree
-                      ? Icons.all_inclusive_rounded
-                      : (isExpired ? Icons.event_busy_rounded : Icons.date_range_rounded),
-                  size: 13,
-                  color: member.isLifetimeFree
-                      ? AppColors.accentViolet
-                      : (isExpired ? AppColors.error : AppColors.accentCyan),
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    member.isLifetimeFree
-                        ? 'Validity: Lifetime Access (Never Expires)'
-                        : (isExpired
-                            ? 'Expired on ${DateFormat('dd MMM yyyy').format(member.expiryDate)} (Started: ${DateFormat('dd MMM yyyy').format(member.startDate)})'
-                            : 'Plan Schedule: ${DateFormat('dd MMM yyyy').format(member.startDate)} → ${DateFormat('dd MMM yyyy').format(member.expiryDate)}'),
-                    style: GoogleFonts.inter(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w600,
-                      color: member.isLifetimeFree
-                          ? AppColors.accentViolet
-                          : (isExpired ? AppColors.error : AppColors.textSecondaryDark),
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // Assigned Batch Display Tag
-          const SizedBox(height: 6),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-            decoration: BoxDecoration(
-              color: member.batchName != null && member.batchName!.isNotEmpty
-                  ? AppColors.accentCyan.withValues(alpha: 0.12)
-                  : const Color(0xFF101724),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: member.batchName != null && member.batchName!.isNotEmpty
-                    ? AppColors.accentCyan.withValues(alpha: 0.35)
-                    : const Color(0xFF1D283A),
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  Icons.schedule_rounded,
-                  size: 13,
-                  color: member.batchName != null && member.batchName!.isNotEmpty
-                      ? AppColors.accentCyan
-                      : Colors.white38,
-                ),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    member.batchName != null && member.batchName!.isNotEmpty
-                        ? 'Batch: ${member.batchName}'
-                        : 'Batch: Unassigned',
-                    style: GoogleFonts.inter(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w600,
-                      color: member.batchName != null && member.batchName!.isNotEmpty
-                          ? AppColors.accentCyan
-                          : Colors.white38,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // Fitness Goal & Physical Metrics (Weight, Height, BMI)
-          if (member.goal != null || member.weight != null || member.height != null) ...[
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: primaryColor.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: primaryColor.withValues(alpha: 0.25)),
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.track_changes_rounded, size: 14, color: primaryColor),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      'Goal: ${member.formattedGoal}  •  ${member.formattedWeight}  •  ${member.formattedHeight}${member.bmi != null ? '  •  BMI: ${member.formattedBmi}' : ''}',
-                      style: GoogleFonts.inter(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.white,
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
                 ],
               ),
             ),
-          ],
+          ),
+        ),
+      );
+    }
 
-          // Optional Emergency Contact Section
-          if (member.hasEmergencyContact) ...[
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: AppColors.accentAmber.withValues(alpha: 0.08),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: AppColors.accentAmber.withValues(alpha: 0.25)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.emergency_outlined, size: 14, color: AppColors.accentAmber),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      'Emergency: ${member.emergencyContactName ?? 'Contact'} (${member.emergencyContactRelation ?? 'Relation'}) • ${member.emergencyPhone ?? ''}',
-                      style: GoogleFonts.inter(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        color: const Color(0xFFFDE68A),
-                      ),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                ],
-              ),
+  Future<void> _showToggleMemberStatusDialog(GymMemberRecord member) async {
+    final willDeactivate = member.isActive;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dCtx) => AlertDialog(
+        backgroundColor: const Color(0xFF141923),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Icon(
+              willDeactivate ? Icons.pause_circle_filled_rounded : Icons.check_circle_rounded,
+              color: willDeactivate ? Colors.orangeAccent : AppColors.success,
+              size: 24,
+            ),
+            const SizedBox(width: 8),
+            Text(
+              willDeactivate ? 'Set Member Inactive?' : 'Activate Member?',
+              style: GoogleFonts.poppins(color: Colors.white, fontWeight: FontWeight.w700),
             ),
           ],
-
-          // Optional Address Display
-          if (member.address.isNotEmpty) ...[
-            const SizedBox(height: 6),
-            Row(
-              children: [
-                const Icon(Icons.location_on_outlined, size: 12, color: AppColors.textSecondaryDark),
-                const SizedBox(width: 4),
-                Expanded(
-                  child: Text(
-                    member.address,
-                    style: GoogleFonts.inter(
-                      fontSize: 10.5,
-                      color: AppColors.textSecondaryDark,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ],
+        ),
+        content: Text(
+          willDeactivate
+              ? 'Are you sure you want to mark ${member.fullName} as Inactive? Members cannot be deleted, but inactive members will be suspended from check-ins and active counts.'
+              : 'Are you sure you want to activate ${member.fullName}? Their membership access will be restored.',
+          style: GoogleFonts.inter(color: Colors.white70, fontSize: 13, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dCtx, false),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white70)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: willDeactivate ? Colors.orangeAccent : AppColors.success,
+              foregroundColor: Colors.white,
             ),
-          ],
-
-          const SizedBox(height: 10),
-          // Action Buttons: Quick Check-In & Details
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'Total Check-Ins: ${member.totalCheckIns}',
-                style: GoogleFonts.inter(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: AppColors.textSecondaryDark,
-                ),
-              ),
-              Row(
-                children: [
-                  InkWell(
-                    onTap: () async {
-                      final tenantId = member.tenantId ??
-                          widget.authController.currentGymTenant?.id ??
-                          widget.authController.currentUser?.tenantId ??
-                          'default_tenant';
-                      await widget.authController.recordMemberCheckIn(
-                        tenantId: tenantId,
-                        memberId: member.id,
-                        memberName: member.fullName,
-                        planName: member.membershipPlan,
-                        method: 'Manual Pass',
-                      );
-                      if (mounted) {
-                        setState(() {
-                          _members = List.from(widget.authController.members);
-                          _recentCheckIns = List.from(widget.authController.checkIns);
-                        });
-                      }
-                      if (mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          SnackBar(
-                            content: Text(
-                              'Checked in ${member.fullName} successfully!',
-                              style: GoogleFonts.inter(fontWeight: FontWeight.w600),
-                            ),
-                            backgroundColor: AppColors.success,
-                            behavior: SnackBarBehavior.floating,
-                          ),
-                        );
-                      }
-                    },
-                    borderRadius: BorderRadius.circular(8),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                      decoration: BoxDecoration(
-                        color: AppColors.accentCyan.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: AppColors.accentCyan.withValues(alpha: 0.35)),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(Icons.qr_code_scanner_rounded, size: 13, color: AppColors.accentCyan),
-                          const SizedBox(width: 5),
-                          Text(
-                            'Check In',
-                            style: GoogleFonts.inter(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w700,
-                              color: AppColors.accentCyan,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  InkWell(
-                    onTap: () => _showEditMemberDialog(member, primaryColor),
-                    borderRadius: BorderRadius.circular(8),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                      decoration: BoxDecoration(
-                        color: Colors.white10,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Icon(Icons.edit_outlined, size: 13, color: Colors.white70),
-                          const SizedBox(width: 4),
-                          Text(
-                            'Edit',
-                            style: GoogleFonts.inter(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                              color: Colors.white70,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton(
-                    icon: const Icon(Icons.delete_outline_rounded, size: 18, color: Colors.white38),
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                    onPressed: () async {
-                      final confirmed = await showDialog<bool>(
-                        context: context,
-                        builder: (dCtx) => AlertDialog(
-                          backgroundColor: const Color(0xFF141923),
-                          title: Text(
-                            'Remove Member?',
-                            style: GoogleFonts.poppins(color: Colors.white, fontWeight: FontWeight.w700),
-                          ),
-                          content: Text(
-                            'Are you sure you want to remove ${member.fullName} from the gym registry?',
-                            style: GoogleFonts.inter(color: Colors.white70),
-                          ),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.pop(dCtx, false),
-                              child: const Text('Cancel', style: TextStyle(color: Colors.white70)),
-                            ),
-                            ElevatedButton(
-                              style: ElevatedButton.styleFrom(backgroundColor: AppColors.error),
-                              onPressed: () => Navigator.pop(dCtx, true),
-                              child: const Text('Remove', style: TextStyle(color: Colors.white)),
-                            ),
-                          ],
-                        ),
-                      );
-                      if (confirmed == true) {
-                        await widget.authController.deleteGymMember(
-                          widget.authController.currentGymTenant?.id ?? 'tenant_metro_01',
-                          member.id,
-                        );
-                        setState(() {
-                          _members = List.from(widget.authController.members);
-                        });
-                      }
-                    },
-                  ),
-                ],
-              ),
-            ],
+            onPressed: () => Navigator.pop(dCtx, true),
+            child: Text(willDeactivate ? 'Set Inactive' : 'Activate'),
           ),
         ],
       ),
     );
+
+    if (confirmed == true && mounted) {
+      final updated = member.copyWith(isActive: !member.isActive);
+      final success = await widget.authController.updateGymMember(updated);
+      if (success && mounted) {
+        setState(() {
+          _members = List.from(widget.authController.members);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              willDeactivate
+                  ? '${member.fullName} is now set as Inactive.'
+                  : '${member.fullName} is now Active.',
+            ),
+            backgroundColor: willDeactivate ? Colors.orangeAccent : AppColors.success,
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
   }
 
   void _showAddTeamMemberDialog(Color primaryColor) {
@@ -7545,7 +8488,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
   }
 
-  // ──────── TAB 3: BATCHES & SCHEDULES ────────
+  // ──────── TAB 2: BATCHES & SCHEDULES ────────
   Widget _buildBatchesTab(Color primaryColor) {
     final query = _batchSearchQuery.trim().toLowerCase();
     final filteredBatches = _batches.where((batch) {
@@ -7641,7 +8584,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                         ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: primaryColor,
-                          foregroundColor: Colors.black,
+                          foregroundColor: Colors.white,
                           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                         ),
@@ -7660,12 +8603,13 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                             label: Text(filter),
                             selected: isSelected,
                             onSelected: (_) => setState(() => _selectedBatchFilter = filter),
-                            selectedColor: primaryColor.withValues(alpha: 0.25),
+                            selectedColor: primaryColor.withValues(alpha: 0.35),
+                            checkmarkColor: Colors.white,
                             backgroundColor: const Color(0xFF182232),
                             labelStyle: GoogleFonts.inter(
                               fontSize: 12,
                               fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
-                              color: isSelected ? primaryColor : Colors.white70,
+                              color: isSelected ? Colors.white : Colors.white70,
                             ),
                             side: BorderSide(
                               color: isSelected ? primaryColor : Colors.white12,
@@ -7714,7 +8658,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                         label: Text('Create First Batch', style: GoogleFonts.poppins(fontWeight: FontWeight.w700)),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: primaryColor,
-                          foregroundColor: Colors.black,
+                          foregroundColor: Colors.white,
                           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                         ),
                       ),
@@ -8037,6 +8981,30 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   }
 
   void _showDeleteBatchDialog(GymBatchModel batch) {
+    final allMembers = _members.isNotEmpty ? _members : widget.authController.members;
+    final linkedMemberIds = <String>{
+      ...batch.memberIds,
+      ...allMembers.where((m) => m.batchId == batch.id).map((m) => m.id),
+    };
+    final count = linkedMemberIds.isNotEmpty
+        ? linkedMemberIds.length
+        : (batch.memberIds.isNotEmpty
+            ? batch.memberIds.length
+            : batch.memberNames.length);
+
+    if (count > 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '$count members are linked with this batch firstly remove these members from batch by editing the batch',
+          ),
+          backgroundColor: AppColors.error,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -8047,7 +9015,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
           style: GoogleFonts.poppins(color: Colors.white, fontWeight: FontWeight.w700),
         ),
         content: Text(
-          'Are you sure you want to delete "${batch.name}"? Enrolled members will not be deleted from your member directory.',
+          'Are you sure you want to delete "${batch.name}"?',
           style: GoogleFonts.inter(color: AppColors.textSecondaryDark),
         ),
         actions: [
@@ -8061,6 +9029,32 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               foregroundColor: Colors.white,
             ),
             onPressed: () async {
+              final currentBatch = widget.authController.batches.where((b) => b.id == batch.id).firstOrNull ?? batch;
+              final currentMembers = _members.isNotEmpty ? _members : widget.authController.members;
+              final currentLinkedIds = <String>{
+                ...currentBatch.memberIds,
+                ...currentMembers.where((m) => m.batchId == currentBatch.id).map((m) => m.id),
+              };
+              final currentCount = currentLinkedIds.isNotEmpty
+                  ? currentLinkedIds.length
+                  : (currentBatch.memberIds.isNotEmpty
+                      ? currentBatch.memberIds.length
+                      : currentBatch.memberNames.length);
+
+              if (currentCount > 0) {
+                Navigator.pop(ctx);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      '$currentCount members are linked with this batch firstly remove these members from batch by editing the batch',
+                    ),
+                    backgroundColor: AppColors.error,
+                    behavior: SnackBarBehavior.floating,
+                  ),
+                );
+                return;
+              }
+
               Navigator.pop(ctx);
               final success = await widget.authController.deleteGymBatch(batch.id);
               if (success && mounted) {
@@ -8093,7 +9087,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     final memberSearchCtrl = TextEditingController();
 
     final isEditing = batchToEdit != null;
-    final Set<String> selectedMemberIds = Set.from(batchToEdit?.memberIds ?? []);
+    final Set<String> selectedMemberIds = Set.from([
+      ...?batchToEdit?.memberIds,
+      if (batchToEdit != null)
+        ..._members.where((m) => m.batchId == batchToEdit.id).map((m) => m.id),
+    ]);
     bool isSaving = false;
 
     const presetTimes = [
@@ -8538,14 +9536,28 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                           final savedBatchName = '$name ($time)';
 
                           if (savedBatchId != null && savedBatchId.isNotEmpty) {
-                            for (final member in _members) {
-                              if (selectedMemberIds.contains(member.id)) {
-                                if (member.batchId != savedBatchId) {
+                            final allMembers = _members.isNotEmpty ? _members : widget.authController.members;
+                            for (final member in allMembers) {
+                              final isSelected = selectedMemberIds.contains(member.id);
+                              final isLinkedToThisBatch = member.batchId == savedBatchId ||
+                                  (batchToEdit != null && (member.batchId == batchToEdit.id || batchToEdit.memberIds.contains(member.id)));
+
+                              if (isSelected) {
+                                if (member.batchId != savedBatchId || member.batchName != savedBatchName) {
+                                  if (member.batchId != null && member.batchId != savedBatchId) {
+                                    final oldBatchIdx = _batches.indexWhere((b) => b.id == member.batchId);
+                                    if (oldBatchIdx != -1) {
+                                      final oldBatch = _batches[oldBatchIdx];
+                                      final updatedIds = List<String>.from(oldBatch.memberIds)..remove(member.id);
+                                      final updatedNames = List<String>.from(oldBatch.memberNames)..removeWhere((n) => n == member.fullName);
+                                      await widget.authController.updateGymBatch(oldBatch.copyWith(memberIds: updatedIds, memberNames: updatedNames));
+                                    }
+                                  }
                                   final updatedMem = member.copyWith(batchId: savedBatchId, batchName: savedBatchName);
                                   await widget.authController.updateGymMember(updatedMem);
                                 }
-                              } else if (member.batchId == savedBatchId) {
-                                final updatedMem = member.copyWith(batchId: null, batchName: null);
+                              } else if (isLinkedToThisBatch) {
+                                final updatedMem = member.copyWith(batchId: null, batchName: null, clearBatch: true);
                                 await widget.authController.updateGymMember(updatedMem);
                               }
                             }
@@ -8583,6 +9595,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
   }
 
+  // ──────── TAB 3: MEMBERSHIP PLANS & PRICING ────────
   Widget _buildPlansTab(Color primaryColor) {
     final query = _planSearchQuery.trim().toLowerCase();
     final filteredPlans = _membershipPlans.where((plan) {
@@ -8827,7 +9840,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
                       backgroundColor: primaryColor,
-                      foregroundColor: Colors.black,
+                      foregroundColor: Colors.white,
                       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                     ),
@@ -8862,7 +9875,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
             decoration: BoxDecoration(
-              color: isSelected ? Colors.black26 : Colors.white12,
+              color: isSelected ? Colors.white24 : Colors.white12,
               borderRadius: BorderRadius.circular(10),
             ),
             child: Text(
@@ -8870,7 +9883,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               style: GoogleFonts.inter(
                 fontSize: 10,
                 fontWeight: FontWeight.w700,
-                color: isSelected ? Colors.black : Colors.white70,
+                color: isSelected ? Colors.white : Colors.white70,
               ),
             ),
           ),
@@ -8878,11 +9891,12 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
       ),
       selected: isSelected,
       selectedColor: color,
+      checkmarkColor: Colors.white,
       backgroundColor: const Color(0xFF19202E),
       labelStyle: GoogleFonts.inter(
         fontSize: 12,
         fontWeight: FontWeight.w600,
-        color: isSelected ? Colors.black : Colors.white70,
+        color: isSelected ? Colors.white : Colors.white70,
       ),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(10),
@@ -10401,7 +11415,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   ElevatedButton.icon(
                     style: ElevatedButton.styleFrom(
                       backgroundColor: primaryColor,
-                      foregroundColor: Colors.black,
+                      foregroundColor: Colors.white,
                       elevation: 0,
                       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                       shape: RoundedRectangleBorder(
@@ -10478,7 +11492,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                         ElevatedButton.icon(
                           style: ElevatedButton.styleFrom(
                             backgroundColor: primaryColor,
-                            foregroundColor: Colors.black,
+                            foregroundColor: Colors.white,
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(12),
                             ),
@@ -10638,6 +11652,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                           : ImageOptimizer.buildImageWidget(
                               member.imageUrl,
                               fit: BoxFit.cover,
+                              primaryColor: member.role.color,
                               placeholder: Center(
                                 child: Text(
                                   member.fullName.isNotEmpty
@@ -11079,6 +12094,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                 : ImageOptimizer.buildImageWidget(
                                     member.imageUrl,
                                     fit: BoxFit.cover,
+                                    primaryColor: member.role.color,
                                     placeholder: Center(
                                       child: Text(
                                         member.fullName.isNotEmpty ? member.fullName[0].toUpperCase() : 'T',
@@ -11556,7 +12572,1336 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
   }
 
-  // ──────── TAB 4: FACILITY & SUBSCRIPTION ────────
+  // ──────── TAB 7: GALLERY (PHOTOS & VIDEOS) ────────
+  Widget _buildGalleryTab(Color primaryColor) {
+    final filtered = _galleryItems.where((item) {
+      if (_galleryFilter == 'Photos' && !item.isImage) return false;
+      if (_galleryFilter == 'Videos' && !item.isVideo) return false;
+      return true;
+    }).toList();
+
+    final photoCount = _galleryItems.where((i) => i.isImage).length;
+    final videoCount = _galleryItems.where((i) => i.isVideo).length;
+    final isFull = _galleryItems.length >= 25;
+    final availableSlots = (25 - _galleryItems.length).clamp(0, 25);
+
+    return RefreshIndicator(
+      color: primaryColor,
+      backgroundColor: const Color(0xFF131822),
+      onRefresh: () async {
+        final tenant = widget.authController.currentGymTenant;
+        await widget.authController.loadGymGalleryItems(tenant?.id, true);
+        if (mounted) {
+          setState(() {
+            _galleryItems = List.from(widget.authController.galleryItems);
+          });
+        }
+      },
+      child: CustomScrollView(
+        slivers: [
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // ── CAPACITY & OVERVIEW BANNER ──
+                  Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [
+                          const Color(0xFF162032),
+                          const Color(0xFF0F172A).withValues(alpha: 0.95),
+                        ],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: isFull
+                            ? Colors.redAccent.withValues(alpha: 0.5)
+                            : primaryColor.withValues(alpha: 0.3),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.3),
+                          blurRadius: 12,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: primaryColor.withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Icon(Icons.photo_library_rounded, color: primaryColor, size: 22),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Expanded(
+                                        child: Text(
+                                          'GYM MEDIA SHOWCASE',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: GoogleFonts.poppins(
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w700,
+                                            letterSpacing: 0.8,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                        decoration: BoxDecoration(
+                                          color: isFull
+                                              ? Colors.redAccent.withValues(alpha: 0.2)
+                                              : primaryColor.withValues(alpha: 0.2),
+                                          borderRadius: BorderRadius.circular(8),
+                                          border: Border.all(
+                                            color: isFull
+                                                ? Colors.redAccent.withValues(alpha: 0.6)
+                                                : primaryColor.withValues(alpha: 0.6),
+                                            width: 1,
+                                          ),
+                                        ),
+                                        child: Text(
+                                          '${_galleryItems.length} / 25 Items',
+                                          style: GoogleFonts.inter(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w700,
+                                            color: isFull ? Colors.redAccent : primaryColor,
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 3),
+                                  Text(
+                                    isFull
+                                        ? 'Gallery capacity reached (max 25 items allowed)'
+                                        : '$availableSlots slot(s) available • Upload up to 10 items at once',
+                                    style: GoogleFonts.inter(
+                                      fontSize: 11,
+                                      color: Colors.white60,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 14),
+
+                        // Progress Meter
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(6),
+                          child: LinearProgressIndicator(
+                            value: (_galleryItems.length / 25).clamp(0.0, 1.0),
+                            backgroundColor: const Color(0xFF222B3C),
+                            valueColor: AlwaysStoppedAnimation<Color>(
+                              isFull
+                                  ? Colors.redAccent
+                                  : _galleryItems.length > 20
+                                      ? Colors.amber
+                                      : primaryColor,
+                            ),
+                            minHeight: 6,
+                          ),
+                        ),
+                        const SizedBox(height: 14),
+
+                        // Metrics & Quick Upload (Responsive & Overflow-Safe)
+                        Row(
+                          children: [
+                            Expanded(
+                              child: SingleChildScrollView(
+                                scrollDirection: Axis.horizontal,
+                                physics: const BouncingScrollPhysics(),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    _buildGalleryStatPill(
+                                      icon: Icons.image_rounded,
+                                      label: '$photoCount Photos',
+                                      color: const Color(0xFF38BDF8),
+                                    ),
+                                    const SizedBox(width: 6),
+                                    _buildGalleryStatPill(
+                                      icon: Icons.play_circle_filled_rounded,
+                                      label: '$videoCount Videos',
+                                      color: const Color(0xFFA78BFA),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            ElevatedButton.icon(
+                              onPressed: isFull ? null : () => _showUploadGalleryDialog(primaryColor),
+                              icon: const Icon(Icons.cloud_upload_rounded, size: 14),
+                              label: Text(
+                                'Upload',
+                                style: GoogleFonts.inter(fontSize: 11.5, fontWeight: FontWeight.w600),
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: isFull ? Colors.grey.shade800 : primaryColor,
+                                foregroundColor: Colors.white,
+                                elevation: 2,
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(9)),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // ── FILTER CHIPS ROW (Scrollable for compact screens) ──
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    physics: const BouncingScrollPhysics(),
+                    child: Row(
+                      children: [
+                        _buildGalleryFilterChip('All', _galleryItems.length, primaryColor),
+                        const SizedBox(width: 8),
+                        _buildGalleryFilterChip('Photos', photoCount, primaryColor),
+                        const SizedBox(width: 8),
+                        _buildGalleryFilterChip('Videos', videoCount, primaryColor),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // ── GALLERY GRID OR EMPTY STATE ──
+          if (filtered.isEmpty)
+            SliverFillRemaining(
+              hasScrollBody: false,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(32),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF162032),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: const Color(0xFF222B3C)),
+                        ),
+                        child: Icon(Icons.photo_library_outlined, size: 48, color: primaryColor.withValues(alpha: 0.7)),
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        _galleryItems.isEmpty
+                            ? 'No Showcase Media Uploaded'
+                            : 'No $_galleryFilter Found',
+                        style: GoogleFonts.poppins(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        _galleryItems.isEmpty
+                            ? 'Add up to 25 high-resolution gym floor photos, equipment shots, and workout reels. Media is automatically optimized before upload.'
+                            : 'Try selecting a different media filter above.',
+                        textAlign: TextAlign.center,
+                        style: GoogleFonts.inter(
+                          fontSize: 12,
+                          color: Colors.white60,
+                          height: 1.4,
+                        ),
+                      ),
+                      if (_galleryItems.isEmpty) ...[
+                        const SizedBox(height: 20),
+                        ElevatedButton.icon(
+                          onPressed: () => _showUploadGalleryDialog(primaryColor),
+                          icon: const Icon(Icons.cloud_upload_rounded, size: 18),
+                          label: Text(
+                            'Upload First Media',
+                            style: GoogleFonts.inter(fontSize: 13, fontWeight: FontWeight.w600),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: primaryColor,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            )
+          else
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 80),
+              sliver: SliverGrid(
+                gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: MediaQuery.of(context).size.width >= 900
+                      ? 4
+                      : MediaQuery.of(context).size.width >= 600
+                          ? 3
+                          : 2,
+                  crossAxisSpacing: 12,
+                  mainAxisSpacing: 12,
+                  childAspectRatio: 0.85,
+                ),
+                delegate: SliverChildBuilderDelegate(
+                  (context, index) {
+                    final item = filtered[index];
+                    return _buildGalleryGridTile(item, primaryColor);
+                  },
+                  childCount: filtered.length,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGalleryStatPill({
+    required IconData icon,
+    required String label,
+    required Color color,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: color),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: GoogleFonts.inter(
+              fontSize: 10.5,
+              fontWeight: FontWeight.w600,
+              color: color,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGalleryFilterChip(String label, int count, Color primaryColor) {
+    final isSelected = _galleryFilter == label;
+    return InkWell(
+      onTap: () {
+        setState(() {
+          _galleryFilter = label;
+        });
+      },
+      borderRadius: BorderRadius.circular(20),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        decoration: BoxDecoration(
+          color: isSelected ? primaryColor.withValues(alpha: 0.2) : const Color(0xFF162032),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: isSelected ? primaryColor : const Color(0xFF222B3C),
+            width: 1,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              label,
+              style: GoogleFonts.inter(
+                fontSize: 12,
+                fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                color: isSelected ? Colors.white : Colors.white60,
+              ),
+            ),
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: isSelected ? primaryColor : const Color(0xFF222B3C),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Text(
+                '$count',
+                style: GoogleFonts.inter(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGalleryGridTile(GymGalleryItemModel item, Color primaryColor) {
+    return InkWell(
+      onTap: () => _openMediaLightbox(item, primaryColor),
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF131822),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: const Color(0xFF222B3C)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.25),
+              blurRadius: 8,
+              offset: const Offset(0, 3),
+            ),
+          ],
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // Media Image Thumbnail
+            ImageOptimizer.buildImageWidget(
+              item.isVideo
+                  ? VideoOptimizer.androidCoverUrl(item.thumbnailUrl)
+                  : (item.thumbnailUrl.isNotEmpty ? item.thumbnailUrl : item.mediaUrl),
+              fit: BoxFit.cover,
+              primaryColor: primaryColor,
+              errorBuilder: (_, __, ___) => Container(
+                color: const Color(0xFF1A2234),
+                child: Icon(
+                  item.isVideo ? Icons.videocam_rounded : Icons.image_rounded,
+                  color: Colors.white24,
+                  size: 32,
+                ),
+              ),
+            ),
+
+            // Video Center Play Indicator
+            if (item.isVideo)
+              Center(
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.65),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white70, width: 1.5),
+                  ),
+                  child: const Icon(
+                    Icons.play_arrow_rounded,
+                    color: Colors.white,
+                    size: 26,
+                  ),
+                ),
+              ),
+
+            // Top Badges Row (Type Pill + Quick Delete)
+            Positioned(
+              top: 8,
+              left: 8,
+              right: 8,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: item.isVideo
+                          ? const Color(0xFFA78BFA).withValues(alpha: 0.9)
+                          : const Color(0xFF0284C7).withValues(alpha: 0.9),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          item.isVideo ? Icons.videocam_rounded : Icons.camera_alt_rounded,
+                          size: 11,
+                          color: Colors.white,
+                        ),
+                        const SizedBox(width: 3),
+                        Text(
+                          item.isVideo ? 'VIDEO' : 'PHOTO',
+                          style: GoogleFonts.inter(
+                            fontSize: 9.5,
+                            fontWeight: FontWeight.w800,
+                            letterSpacing: 0.5,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  InkWell(
+                    onTap: () => _confirmDeleteGalleryItem(item, primaryColor),
+                    borderRadius: BorderRadius.circular(14),
+                    child: Container(
+                      padding: const EdgeInsets.all(5),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.6),
+                        shape: BoxShape.circle,
+                        border: Border.all(color: Colors.white24, width: 0.8),
+                      ),
+                      child: const Icon(Icons.delete_outline_rounded, color: Colors.white, size: 14),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // Bottom Gradient Overlay with Metadata
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(10, 24, 10, 8),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      Colors.transparent,
+                      Colors.black.withValues(alpha: 0.9),
+                    ],
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
+                  ),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (item.title.isNotEmpty)
+                      Text(
+                        item.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.inter(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                    const SizedBox(height: 3),
+                    Row(
+                      children: [
+                        Text(
+                          item.formattedSize,
+                          style: GoogleFonts.inter(
+                            fontSize: 10,
+                            color: Colors.white70,
+                          ),
+                        ),
+                        if (item.compressionPercentage > 0) ...[
+                          const SizedBox(width: 5),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF10B981).withValues(alpha: 0.25),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              '-${item.compressionPercentage.toStringAsFixed(0)}%',
+                              style: GoogleFonts.inter(
+                                fontSize: 9,
+                                fontWeight: FontWeight.w700,
+                                color: const Color(0xFF34D399),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── UPLOAD GALLERY MEDIA DIALOG (MAX 10 AT ONCE, CAPPED AT 25) ──
+  Future<void> _showUploadGalleryDialog(Color primaryColor) async {
+    final availableSlots = (25 - _galleryItems.length).clamp(0, 25);
+    if (availableSlots <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Gallery capacity limit reached (25 items max). Delete existing items to add more.'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
+    final maxCanSelect = availableSlots < 10 ? availableSlots : 10;
+    final List<_StagedGalleryItem> stagedItems = [];
+    bool isProcessing = false;
+    String statusMessage = '';
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (modalCtx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final imagePicker = ImagePicker();
+
+            Future<void> pickPhotos() async {
+              final remaining = maxCanSelect - stagedItems.length;
+              if (remaining <= 0) {
+                ScaffoldMessenger.of(modalCtx).showSnackBar(
+                  SnackBar(
+                    content: Text('Batch limit reached! Maximum $maxCanSelect items can be uploaded in this batch.'),
+                    backgroundColor: Colors.amber.shade800,
+                  ),
+                );
+                return;
+              }
+
+              try {
+                final List<XFile> picked = await imagePicker.pickMultiImage(limit: remaining);
+                if (picked.isEmpty) return;
+
+                final allowed = picked.take(remaining).toList();
+                for (final file in allowed) {
+                  final bytes = await file.readAsBytes();
+                  stagedItems.add(
+                    _StagedGalleryItem(
+                      bytes: bytes,
+                      fileName: file.name,
+                      mediaType: GymGalleryMediaType.image,
+                      originalSizeBytes: bytes.lengthInBytes,
+                    ),
+                  );
+                }
+                setModalState(() {});
+              } catch (e) {
+                debugPrint('Photo picker error: $e');
+              }
+            }
+
+            Future<void> pickVideo() async {
+              final remaining = maxCanSelect - stagedItems.length;
+              if (remaining <= 0) {
+                ScaffoldMessenger.of(modalCtx).showSnackBar(
+                  SnackBar(
+                    content: Text('Batch limit reached! Maximum $maxCanSelect items can be uploaded in this batch.'),
+                    backgroundColor: Colors.amber.shade800,
+                  ),
+                );
+                return;
+              }
+
+              try {
+                final XFile? file = await imagePicker.pickVideo(
+                  source: ImageSource.gallery,
+                  maxDuration: const Duration(minutes: 5),
+                );
+                if (file == null) return;
+
+                final bytes = await file.readAsBytes();
+                // Check video size limit (max 30MB)
+                if (bytes.lengthInBytes > 30 * 1024 * 1024) {
+                  if (modalCtx.mounted) {
+                    ScaffoldMessenger.of(modalCtx).showSnackBar(
+                      const SnackBar(
+                        content: Text('Video file is larger than 30MB. Please select a shorter or lower-resolution clip.'),
+                        backgroundColor: Colors.redAccent,
+                      ),
+                    );
+                  }
+                  return;
+                }
+
+                stagedItems.add(
+                  _StagedGalleryItem(
+                    bytes: bytes,
+                    fileName: file.name,
+                    sourcePath: file.path,
+                    mediaType: GymGalleryMediaType.video,
+                    originalSizeBytes: bytes.lengthInBytes,
+                  ),
+                );
+                setModalState(() {});
+              } catch (e) {
+                debugPrint('Video picker error: $e');
+              }
+            }
+
+            Future<void> performUpload() async {
+              if (stagedItems.isEmpty) return;
+
+              setModalState(() {
+                isProcessing = true;
+                statusMessage = 'Preparing ${stagedItems.length} media items for upload...';
+              });
+
+              try {
+                final List<GymGalleryUploadPayload> payloads = [];
+
+                for (int i = 0; i < stagedItems.length; i++) {
+                  final item = stagedItems[i];
+                  if (item.mediaType == GymGalleryMediaType.video) {
+                    setModalState(() {
+                      statusMessage = 'Optimizing video ${i + 1} of ${stagedItems.length}...';
+                    });
+                    final prepared = await VideoOptimizer.prepareUpload(
+                      sourcePath: item.sourcePath,
+                      originalBytes: item.bytes,
+                      onStage: (stage) {
+                        if (stage == 'thumbnail') {
+                          setModalState(() {
+                            statusMessage = 'Creating Android cover thumbnail ${i + 1} of ${stagedItems.length}...';
+                          });
+                        }
+                      },
+                    );
+                    payloads.add(
+                      GymGalleryUploadPayload(
+                        bytes: prepared.bytes,
+                        fileName: item.fileName,
+                        mediaType: item.mediaType,
+                        title: item.title,
+                        originalSizeBytes: item.originalSizeBytes,
+                        durationSeconds: prepared.durationSeconds ?? item.durationSeconds,
+                        customThumbnailBytes: prepared.thumbnailBytes,
+                        width: prepared.width,
+                        height: prepared.height,
+                      ),
+                    );
+                  } else {
+                    setModalState(() {
+                      statusMessage = 'Optimizing image ${i + 1} of ${stagedItems.length}...';
+                    });
+                    payloads.add(
+                      GymGalleryUploadPayload(
+                        bytes: item.bytes,
+                        fileName: item.fileName,
+                        mediaType: item.mediaType,
+                        title: item.title,
+                        originalSizeBytes: item.originalSizeBytes,
+                        durationSeconds: item.durationSeconds,
+                      ),
+                    );
+                  }
+                }
+
+                setModalState(() {
+                  statusMessage = 'Uploading to Gym Facility storage...';
+                });
+
+                final success = await widget.authController.uploadGymGalleryMedia(payloads);
+
+                if (success && mounted) {
+                  setState(() {
+                    _galleryItems = List.from(widget.authController.galleryItems);
+                  });
+                  Navigator.pop(modalCtx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Row(
+                        children: [
+                          const Icon(Icons.check_circle_rounded, color: Colors.white, size: 20),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              'Successfully uploaded & optimized ${payloads.length} gallery item(s)!',
+                              style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                            ),
+                          ),
+                        ],
+                      ),
+                      backgroundColor: const Color(0xFF10B981),
+                    ),
+                  );
+                } else if (mounted) {
+                  setModalState(() {
+                    isProcessing = false;
+                  });
+                  ScaffoldMessenger.of(modalCtx).showSnackBar(
+                    SnackBar(
+                      content: Text(widget.authController.errorMessage ?? 'Upload failed. Please try again.'),
+                      backgroundColor: Colors.redAccent,
+                    ),
+                  );
+                }
+              } catch (e) {
+                setModalState(() {
+                  isProcessing = false;
+                });
+                ScaffoldMessenger.of(modalCtx).showSnackBar(
+                  SnackBar(
+                    content: Text('Upload error: $e'),
+                    backgroundColor: Colors.redAccent,
+                  ),
+                );
+              }
+            }
+
+            return Padding(
+              padding: EdgeInsets.only(
+                bottom: MediaQuery.of(modalCtx).viewInsets.bottom,
+              ),
+              child: Container(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(modalCtx).size.height * 0.88,
+                ),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF101725),
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                  border: Border(top: BorderSide(color: Color(0xFF222B3C))),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Handle Bar
+                    Container(
+                      margin: const EdgeInsets.only(top: 10, bottom: 6),
+                      width: 44,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+
+                    // Header
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 10, 20, 12),
+                      child: Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: primaryColor.withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Icon(Icons.cloud_upload_rounded, color: primaryColor, size: 22),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Upload Facility Media',
+                                  style: GoogleFonts.poppins(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.white,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Up to 10 items at once • Max 25 total • Auto-optimized',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 11,
+                                    color: Colors.white60,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close_rounded, color: Colors.white60),
+                            onPressed: isProcessing ? null : () => Navigator.pop(modalCtx),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    const Divider(color: Color(0xFF1E2B3E), height: 1),
+
+                    // Quota Indicator Banner
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                      color: const Color(0xFF162032),
+                      child: Row(
+                        children: [
+                          Icon(Icons.info_outline_rounded, size: 14, color: primaryColor),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Gallery: ${_galleryItems.length} / 25 used ($availableSlots remaining). You can add up to $maxCanSelect in this batch.',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                color: Colors.white70,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    // Picker Action Buttons
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 14, 20, 12),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: (isProcessing || stagedItems.length >= maxCanSelect) ? null : pickPhotos,
+                              icon: const Icon(Icons.add_photo_alternate_rounded, size: 18),
+                              label: Text(
+                                '+ Add Photos',
+                                style: GoogleFonts.inter(fontSize: 12.5, fontWeight: FontWeight.w600),
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                side: BorderSide(color: primaryColor.withValues(alpha: 0.6)),
+                                padding: const EdgeInsets.symmetric(vertical: 12),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: (isProcessing || stagedItems.length >= maxCanSelect) ? null : pickVideo,
+                              icon: const Icon(Icons.video_call_rounded, size: 18),
+                              label: Text(
+                                '+ Add Video',
+                                style: GoogleFonts.inter(fontSize: 12.5, fontWeight: FontWeight.w600),
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: const Color(0xFFA78BFA),
+                                side: BorderSide(color: const Color(0xFFA78BFA).withValues(alpha: 0.6)),
+                                padding: const EdgeInsets.symmetric(vertical: 12),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    // Staged Items List
+                    Expanded(
+                      child: stagedItems.isEmpty
+                          ? Center(
+                              child: Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(Icons.queue_play_next_rounded, size: 42, color: Colors.white24),
+                                  const SizedBox(height: 10),
+                                  Text(
+                                    'No media queued for upload',
+                                    style: GoogleFonts.poppins(fontSize: 13, color: Colors.white54),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    'Tap buttons above to select photos or videos',
+                                    style: GoogleFonts.inter(fontSize: 11, color: Colors.white38),
+                                  ),
+                                ],
+                              ),
+                            )
+                          : ListView.separated(
+                              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+                              itemCount: stagedItems.length,
+                              separatorBuilder: (_, __) => const SizedBox(height: 10),
+                              itemBuilder: (context, idx) {
+                                final item = stagedItems[idx];
+                                final sizeStr = (item.originalSizeBytes / (1024 * 1024)).toStringAsFixed(2);
+                                return Container(
+                                  padding: const EdgeInsets.all(10),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF162032),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: const Color(0xFF222B3C)),
+                                  ),
+                                  child: Row(
+                                    children: [
+                                      // Thumbnail / Icon
+                                      ClipRRect(
+                                        borderRadius: BorderRadius.circular(8),
+                                        child: SizedBox(
+                                          width: 56,
+                                          height: 56,
+                                          child: item.mediaType == GymGalleryMediaType.image
+                                              ? Image.memory(item.bytes, fit: BoxFit.cover)
+                                              : Container(
+                                                  color: const Color(0xFF0F172A),
+                                                  child: const Icon(
+                                                    Icons.play_circle_fill_rounded,
+                                                    color: Color(0xFFA78BFA),
+                                                    size: 28,
+                                                  ),
+                                                ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      // File details & caption input
+                                      Expanded(
+                                        child: Column(
+                                          crossAxisAlignment: CrossAxisAlignment.start,
+                                          children: [
+                                            Row(
+                                              children: [
+                                                Container(
+                                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                                                  decoration: BoxDecoration(
+                                                    color: item.mediaType == GymGalleryMediaType.image
+                                                        ? const Color(0xFF0284C7).withValues(alpha: 0.2)
+                                                        : const Color(0xFFA78BFA).withValues(alpha: 0.2),
+                                                    borderRadius: BorderRadius.circular(4),
+                                                  ),
+                                                  child: Text(
+                                                    item.mediaType.displayName.toUpperCase(),
+                                                    style: GoogleFonts.inter(
+                                                      fontSize: 8.5,
+                                                      fontWeight: FontWeight.w700,
+                                                      color: item.mediaType == GymGalleryMediaType.image
+                                                          ? const Color(0xFF38BDF8)
+                                                          : const Color(0xFFA78BFA),
+                                                    ),
+                                                  ),
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Expanded(
+                                                  child: Text(
+                                                    item.fileName,
+                                                    maxLines: 1,
+                                                    overflow: TextOverflow.ellipsis,
+                                                    style: GoogleFonts.inter(fontSize: 11.5, color: Colors.white),
+                                                  ),
+                                                ),
+                                                Text(
+                                                  '$sizeStr MB',
+                                                  style: GoogleFonts.inter(fontSize: 10.5, color: Colors.white54),
+                                                ),
+                                              ],
+                                            ),
+                                            const SizedBox(height: 6),
+                                            TextField(
+                                              style: GoogleFonts.inter(fontSize: 11.5, color: Colors.white),
+                                              decoration: InputDecoration(
+                                                hintText: 'Add caption (optional)...',
+                                                hintStyle: GoogleFonts.inter(fontSize: 11, color: Colors.white38),
+                                                isDense: true,
+                                                contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                                                filled: true,
+                                                fillColor: const Color(0xFF0F172A),
+                                                border: OutlineInputBorder(
+                                                  borderRadius: BorderRadius.circular(8),
+                                                  borderSide: const BorderSide(color: Color(0xFF222B3C)),
+                                                ),
+                                                enabledBorder: OutlineInputBorder(
+                                                  borderRadius: BorderRadius.circular(8),
+                                                  borderSide: const BorderSide(color: Color(0xFF222B3C)),
+                                                ),
+                                              ),
+                                              onChanged: (val) {
+                                                item.title = val.trim();
+                                              },
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      // Remove button
+                                      IconButton(
+                                        icon: const Icon(Icons.delete_outline_rounded, color: Colors.redAccent, size: 20),
+                                        onPressed: isProcessing
+                                            ? null
+                                            : () {
+                                                setModalState(() {
+                                                  stagedItems.removeAt(idx);
+                                                });
+                                              },
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+
+                    // Progress / Status
+                    if (isProcessing)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                        child: Row(
+                          children: [
+                            SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: primaryColor),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                statusMessage,
+                                style: GoogleFonts.inter(fontSize: 11, color: Colors.white70),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+
+                    // Bottom Upload Action Bar
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF0F172A),
+                        border: Border(top: BorderSide(color: Color(0xFF1E2B3E))),
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton(
+                              onPressed: (isProcessing || stagedItems.isEmpty) ? null : performUpload,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: primaryColor,
+                                foregroundColor: Colors.white,
+                                elevation: 3,
+                                padding: const EdgeInsets.symmetric(vertical: 14),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                              ),
+                              child: Text(
+                                stagedItems.isEmpty
+                                    ? 'Select Media To Upload'
+                                    : 'Optimize & Upload ${stagedItems.length} Item(s)',
+                                style: GoogleFonts.inter(
+                                  fontSize: 13.5,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // ── LIGHTBOX / FULLSCREEN VIEWER ──
+  void _openMediaLightbox(GymGalleryItemModel item, Color primaryColor) {
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.92),
+      builder: (dialogCtx) {
+        return Dialog(
+          backgroundColor: Colors.transparent,
+          insetPadding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Header Controls
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: item.isVideo ? const Color(0xFFA78BFA) : primaryColor,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      item.mediaType.displayName.toUpperCase(),
+                      style: GoogleFonts.inter(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.delete_forever_rounded, color: Colors.redAccent),
+                        tooltip: 'Delete Media',
+                        onPressed: () {
+                          Navigator.pop(dialogCtx);
+                          _confirmDeleteGalleryItem(item, primaryColor);
+                        },
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.close_rounded, color: Colors.white),
+                        tooltip: 'Close',
+                        onPressed: () => Navigator.pop(dialogCtx),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+
+              // Main Preview
+              Flexible(
+                child: Container(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.of(dialogCtx).size.height * 0.65,
+                    maxWidth: 720,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: const Color(0xFF222B3C)),
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: item.isVideo
+                      ? GalleryVideoPlayer(mediaUrl: item.mediaUrl)
+                      : InteractiveViewer(
+                          minScale: 1.0,
+                          maxScale: 3.5,
+                          child: ImageOptimizer.buildImageWidget(
+                            item.mediaUrl.isNotEmpty ? item.mediaUrl : item.thumbnailUrl,
+                            fit: BoxFit.contain,
+                            primaryColor: primaryColor,
+                          ),
+                        ),
+                ),
+              ),
+
+              const SizedBox(height: 12),
+
+              // Metadata card
+              Container(
+                constraints: const BoxConstraints(maxWidth: 720),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF162032),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFF222B3C)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (item.title.isNotEmpty) ...[
+                      Text(
+                        item.title,
+                        style: GoogleFonts.poppins(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                    ],
+                    Row(
+                      children: [
+                        Icon(Icons.bolt_rounded, size: 14, color: const Color(0xFF34D399)),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Optimization: ${item.savingsLabel}',
+                          style: GoogleFonts.inter(fontSize: 11, color: Colors.white70),
+                        ),
+                        const Spacer(),
+                        Text(
+                          DateFormat('MMM d, yyyy').format(item.createdAt),
+                          style: GoogleFonts.inter(fontSize: 11, color: Colors.white38),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ── DELETE GALLERY ITEM CONFIRMATION ──
+  Future<void> _confirmDeleteGalleryItem(GymGalleryItemModel item, Color primaryColor) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF162032),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: Color(0xFF222B3C)),
+        ),
+        title: Row(
+          children: [
+            const Icon(Icons.warning_amber_rounded, color: Colors.redAccent, size: 24),
+            const SizedBox(width: 10),
+            Text(
+              'Delete Media Item?',
+              style: GoogleFonts.poppins(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
+            ),
+          ],
+        ),
+        content: Text(
+          'Are you sure you want to remove this ${item.mediaType.displayName.toLowerCase()} from your gym facility gallery? This action cannot be undone.',
+          style: GoogleFonts.inter(fontSize: 12.5, color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.inter(color: Colors.white60)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+            ),
+            child: Text('Delete', style: GoogleFonts.inter(fontWeight: FontWeight.w600)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true && mounted) {
+      final success = await widget.authController.deleteGymGalleryItem(item.id);
+      if (success && mounted) {
+        setState(() {
+          _galleryItems = List.from(widget.authController.galleryItems);
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Media item deleted successfully.'),
+            backgroundColor: Color(0xFF10B981),
+          ),
+        );
+      }
+    }
+  }
+
+  // ──────── TAB 8: FACILITY & SUBSCRIPTION ────────
   Widget _buildFacilityTab(Color primaryColor, GymTenantModel? tenant) {
     final gymName = tenant?.gymName ?? 'GCRM One Fitness Facility';
     final address = tenant?.address ?? '452 5th Avenue, New York, NY';
@@ -11971,3 +14316,23 @@ class _ExpensesDonutPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _ExpensesDonutPainter oldDelegate) => true;
 }
+
+class _StagedGalleryItem {
+  final Uint8List bytes;
+  final String fileName;
+  final String? sourcePath;
+  final GymGalleryMediaType mediaType;
+  final int originalSizeBytes;
+  int? durationSeconds;
+  String title;
+
+  _StagedGalleryItem({
+    required this.bytes,
+    required this.fileName,
+    this.sourcePath,
+    required this.mediaType,
+    required this.originalSizeBytes,
+  }) : title = '';
+}
+
+

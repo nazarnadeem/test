@@ -29,7 +29,7 @@ class _SuperAdminSignUpScreenState extends State<SuperAdminSignUpScreen> {
   final _passwordController = TextEditingController();
   final _confirmPasswordController = TextEditingController();
   final _securityPinController = TextEditingController();
-  final _orgController = TextEditingController(text: 'GCRM ONE Global Platform');
+  final _orgController = TextEditingController();
 
   @override
   void dispose() {
@@ -67,12 +67,8 @@ class _SuperAdminSignUpScreenState extends State<SuperAdminSignUpScreen> {
       fullName: _nameController.text.trim(),
       email: _emailController.text.trim(),
       password: _passwordController.text,
-      phone: _phoneController.text.trim().isEmpty
-          ? '+91 98765 43210'
-          : _phoneController.text.trim(),
-      securityPin: _securityPinController.text.trim().isEmpty
-          ? '884920'
-          : _securityPinController.text.trim(),
+      phone: _phoneController.text.trim(),
+      securityPin: _securityPinController.text.trim(),
       organization: _orgController.text.trim(),
     );
 
@@ -259,7 +255,7 @@ class _SuperAdminSignUpScreenState extends State<SuperAdminSignUpScreen> {
                               CustomTextField(
                                 controller: _emailController,
                                 label: 'Super Admin Email',
-                                hint: 'superadmin@gcrmone.com',
+                                hint: 'name@example.com',
                                 prefixIcon: Icons.email_rounded,
                                 keyboardType: TextInputType.emailAddress,
                                 validator: Validators.email,

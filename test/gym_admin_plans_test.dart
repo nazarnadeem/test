@@ -287,8 +287,8 @@ void main() {
       // Verify empty members directory message is shown
       expect(find.text('No Members Enrolled Yet'), findsOneWidget);
 
-      // Tap Enroll Member FAB
-      final enrollFab = find.byType(FloatingActionButton);
+      // Tap Enroll Member FAB (action FAB on the right)
+      final enrollFab = find.byType(FloatingActionButton).last;
       await tester.tap(enrollFab);
       await tester.pumpAndSettle();
 

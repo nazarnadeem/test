@@ -39,8 +39,8 @@ class DefaultFirebaseOptions {
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyAjuFTXDxZ_dOu7DyyPndVxNdWOJqB8Beo',
-    appId: '1:471565987174:ios:0dc445a6d9f929dfc8eca7',
+    apiKey: 'AIzaSyDsvAxMuRvdWs82Y6aDbTjcCPjnxul4gus',
+    appId: '1:471565987174:android:5b8172b602bfa4f7c8eca7',
     messagingSenderId: '471565987174',
     projectId: 'gcrm-one',
     storageBucket: 'gcrm-one.firebasestorage.app',
