@@ -1,3 +1,5 @@
+import 'package:flutter/services.dart';
+
 import '../constants/app_strings.dart';
 
 /// Form and input validation helper methods for GCRM One.
@@ -59,15 +61,32 @@ class Validators {
     return null;
   }
 
-  /// Validates phone number format
-  static String? phone(String? value) {
-    if (value == null || value.trim().isEmpty) {
-      return 'Phone number is required.';
+  static const String mobileHint = '9876543210';
+
+  static final List<TextInputFormatter> mobileInputFormatters = [
+    FilteringTextInputFormatter.digitsOnly,
+    LengthLimitingTextInputFormatter(10),
+  ];
+
+  /// Keeps the last 10 digits so saved numbers with a country code still fit the field.
+  static String tenDigits(String? value) {
+    final digits = (value ?? '').replaceAll(RegExp(r'\D'), '');
+    if (digits.length <= 10) return digits;
+    return digits.substring(digits.length - 10);
+  }
+
+  /// Validates a required 10 digit mobile number.
+  static String? phone(String? value) => _mobile(value, required: true);
+
+  /// Validates an optional 10 digit mobile number.
+  static String? optionalPhone(String? value) => _mobile(value, required: false);
+
+  static String? _mobile(String? value, {required bool required}) {
+    final digits = (value ?? '').replaceAll(RegExp(r'\D'), '');
+    if (digits.isEmpty) {
+      return required ? 'Enter a 10 digit mobile number.' : null;
     }
-    final cleanPhone = value.replaceAll(RegExp(r'[\s\-\(\)\+]'), '');
-    if (cleanPhone.length < 7 || cleanPhone.length > 15) {
-      return 'Please enter a valid phone number.';
-    }
+    if (digits.length != 10) return 'Enter a 10 digit mobile number.';
     return null;
   }
 }

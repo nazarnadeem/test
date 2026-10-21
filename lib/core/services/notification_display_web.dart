@@ -7,6 +7,9 @@ import 'package:web/web.dart' as web;
 class NotificationDisplay {
   static bool _ready = false;
 
+  /// Called when the user taps a banner shown while the app is open.
+  static void Function(String? payload)? onTap;
+
   static Future<void> initialize() async {
     if (_ready) return;
     try {
@@ -24,14 +27,20 @@ class NotificationDisplay {
     required String id,
     required String title,
     required String body,
+    String? payload,
   }) async {
     await initialize();
     if (!_ready || title.trim().isEmpty) return;
     try {
-      web.Notification(
+      final notification = web.Notification(
         title,
         web.NotificationOptions(body: body, tag: id),
       );
+      if (payload != null) {
+        notification.onclick = ((web.Event event) {
+          onTap?.call(payload);
+        }).toJS;
+      }
     } catch (e) {
       debugPrint('NotificationDisplay.show error: $e');
     }

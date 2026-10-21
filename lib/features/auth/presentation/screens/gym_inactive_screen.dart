@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../../../core/constants/app_colors.dart';
+import '../../../../core/constants/app_strings.dart';
 import '../../../../core/widgets/custom_button.dart';
 import '../../controllers/auth_controller.dart';
 import 'gym_admin_dashboard_screen.dart';
@@ -138,19 +139,19 @@ class _GymInactiveScreenState extends State<GymInactiveScreen> {
                   _buildContactItem(
                     icon: Icons.alternate_email_rounded,
                     title: 'Platform Admin Email',
-                    value: 'admin@gcrmone.com',
+                    value: AppStrings.adminEmail,
                   ),
                   const Divider(color: Color(0xFF283448), height: 16),
                   _buildContactItem(
                     icon: Icons.headset_mic_rounded,
                     title: 'Support Desk Email',
-                    value: 'support@gcrmone.com',
+                    value: AppStrings.supportEmail,
                   ),
                   const Divider(color: Color(0xFF283448), height: 16),
                   _buildContactItem(
                     icon: Icons.phone_in_talk_rounded,
                     title: 'Direct Toll-Free Helpline',
-                    value: '+1 (800) 555-GCRM (4276)',
+                    value: AppStrings.supportPhone,
                   ),
                 ],
               ),

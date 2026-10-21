@@ -1404,9 +1404,15 @@ class MockAuthService implements AuthRepository {
     return record;
   }
 
+  String? _sentHistoryCursorId;
+
   @override
-  Future<List<PushNotificationRecord>> getSentNotificationsHistory({int limit = 50}) async {
+  Future<SentNotificationPage> getSentNotificationsHistory({
+    int limit = SentNotificationPage.pageSize,
+    bool reset = true,
+  }) async {
     await Future.delayed(const Duration(milliseconds: 150));
+    final pageSize = limit.clamp(1, SentNotificationPage.pageSize).toInt();
     if (_sentNotifications.isEmpty) {
       _sentNotifications.addAll([
         PushNotificationRecord(
@@ -1439,7 +1445,18 @@ class MockAuthService implements AuthRepository {
         ),
       ]);
     }
-    return List.unmodifiable(_sentNotifications.take(limit));
+    if (reset) _sentHistoryCursorId = null;
+    var start = 0;
+    if (_sentHistoryCursorId != null) {
+      final index = _sentNotifications.indexWhere((item) => item.id == _sentHistoryCursorId);
+      start = index < 0 ? 0 : index + 1;
+    }
+    final slice = _sentNotifications.skip(start).take(pageSize).toList();
+    if (slice.isNotEmpty) _sentHistoryCursorId = slice.last.id;
+    return SentNotificationPage(
+      records: List.unmodifiable(slice),
+      hasMore: start + slice.length < _sentNotifications.length,
+    );
   }
 }
 

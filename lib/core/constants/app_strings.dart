@@ -1,14 +1,20 @@
+import '../config/white_label_config.dart';
+
 /// Centralized string constants for GCRM One application.
+/// Brand lines come from [WhiteLabelConfig] so a white-label build
+/// changes `white_label/active.json` instead of this file.
 class AppStrings {
   AppStrings._();
 
-  // Branding
-  static const String appName = 'GCRM ONE';
-  static const String appNamePrefix = 'GCRM ';
-  static const String appNameSuffix = 'ONE';
-  static const String tagline = 'All Your Gym Operations, Unified';
-  static const String appDescription =
-      'The modern multi-vendor operating system for gym chains, independent fitness clubs, trainers, and members.';
+  // Branding. These follow white_label/active.json.
+  static String get appName => WhiteLabelConfig.appName;
+  static String get appNamePrefix => WhiteLabelConfig.appNamePrefix;
+  static String get appNameSuffix => WhiteLabelConfig.appNameSuffix;
+  static String get tagline => WhiteLabelConfig.tagline;
+  static String get appDescription => WhiteLabelConfig.appDescription;
+  static String get supportEmail => WhiteLabelConfig.supportEmail;
+  static String get adminEmail => WhiteLabelConfig.adminEmail;
+  static String get supportPhone => WhiteLabelConfig.supportPhone;
 
   // Super Admin Portal
   static const String superAdminPortal = 'Super Admin Portal';
@@ -26,8 +32,8 @@ class AppStrings {
   static const String welcomeBack = 'Welcome Back';
   static const String loginSubtitle = 'Sign in to access your gym workspace';
   static const String createVendorAccount = 'Register New Gym Chain';
-  static const String vendorRegisterSubtitle =
-      'Onboard your fitness facility to GCRM One in 3 simple steps';
+  static String get vendorRegisterSubtitle =>
+      'Onboard your fitness facility to $appName in 3 simple steps';
   static const String createMemberAccount = 'Join Your Gym';
   static const String memberRegisterSubtitle =
       'Enter your details & gym code to access your membership pass';

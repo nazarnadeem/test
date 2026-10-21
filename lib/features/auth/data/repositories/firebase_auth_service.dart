@@ -4,6 +4,7 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import '../../../../core/config/white_label_config.dart';
 import '../../../../core/constants/app_strings.dart';
 import '../../../../core/utils/image_optimizer.dart';
 import '../models/user_model.dart';
@@ -72,6 +73,87 @@ class FirebaseAuthService implements AuthRepository {
       _storage = FirebaseStorage.instance;
     }
     return _storage!;
+  }
+
+  /// Reads one tenant document. White-label builds never scan the collection.
+  Future<_TenantHit?> _readTenant(String tenantId) async {
+    final doc = await firestore.collection('tenants').doc(tenantId).get();
+    if (!doc.exists || doc.data() == null) return null;
+    return _TenantHit(doc.id, doc.data()!);
+  }
+
+  /// Finds the gym this email or uid administers, limited to the env allow-list.
+  Future<_TenantHit?> _findOwningTenant({
+    required String uid,
+    required String normalizedEmail,
+  }) async {
+    bool matches(_TenantHit hit) {
+      final data = hit.data;
+      final emails = [
+        (data['adminEmail'] as String?)?.trim().toLowerCase(),
+        (data['ownerEmail'] as String?)?.trim().toLowerCase(),
+      ];
+      final ids = [
+        data['adminId']?.toString(),
+        data['ownerId']?.toString(),
+      ];
+      return emails.contains(normalizedEmail) || ids.contains(uid);
+    }
+
+    if (WhiteLabelConfig.isRestricted) {
+      for (final id in WhiteLabelConfig.allowedTenantIds) {
+        final hit = await _readTenant(id);
+        if (hit != null && matches(hit)) return hit;
+      }
+      return null;
+    }
+
+    final queries = <Query<Map<String, dynamic>>>[
+      firestore.collection('tenants').where('adminEmail', isEqualTo: normalizedEmail).limit(1),
+      firestore.collection('tenants').where('ownerEmail', isEqualTo: normalizedEmail).limit(1),
+      firestore.collection('tenants').where('adminId', isEqualTo: uid).limit(1),
+      firestore.collection('tenants').where('ownerId', isEqualTo: uid).limit(1),
+    ];
+    for (final query in queries) {
+      final snap = await query.get();
+      if (snap.docs.isEmpty) continue;
+      final doc = snap.docs.first;
+      return _TenantHit(doc.id, doc.data());
+    }
+    return null;
+  }
+
+  /// Resolves a gym code without listing gyms outside this app.
+  Future<_TenantHit?> _tenantForGymCode(String gymCode) async {
+    final code = gymCode.trim().toUpperCase();
+    if (code.isEmpty) return null;
+    if (WhiteLabelConfig.isRestricted) {
+      for (final id in WhiteLabelConfig.allowedTenantIds) {
+        final hit = await _readTenant(id);
+        if (hit == null) continue;
+        final value = (hit.data['gymCode'] as String?)?.trim().toUpperCase() ?? '';
+        if (value == code) return hit;
+      }
+      return null;
+    }
+    final snap = await firestore
+        .collection('tenants')
+        .where('gymCode', isEqualTo: code)
+        .limit(1)
+        .get();
+    if (snap.docs.isEmpty) return null;
+    final doc = snap.docs.first;
+    return _TenantHit(doc.id, doc.data());
+  }
+
+  Future<AuthSession> _acceptSession(AuthSession session) async {
+    if (WhiteLabelConfig.allows(session.user.tenantId)) return session;
+    if (_isFirebaseReady) {
+      try {
+        await auth.signOut();
+      } catch (_) {}
+    }
+    throw TenantAccessException('This account is not part of this gym app.');
   }
 
   Future<void> _ensureFirebaseAuthSession() async {
@@ -173,6 +255,7 @@ class FirebaseAuthService implements AuthRepository {
     DateTime? planExpiryDate,
     bool isLifetimeFree = false,
   }) async {
+    WhiteLabelConfig.ensureGymCreationAllowed();
     if (!_isFirebaseReady) {
       return _fallbackService.registerGymWithAdmin(
         gymName: gymName,
@@ -366,15 +449,16 @@ class FirebaseAuthService implements AuthRepository {
     String? securityPin,
     String? organization,
   }) async {
+    WhiteLabelConfig.ensurePlatformAdminAllowed();
     if (!_isFirebaseReady) {
-      return _fallbackService.registerSuperAdmin(
+      return await _acceptSession(await _fallbackService.registerSuperAdmin(
         fullName: fullName,
         email: email,
         password: password,
         phone: phone,
         securityPin: securityPin,
         organization: organization,
-      );
+      ));
     }
 
     try {
@@ -469,13 +553,13 @@ class FirebaseAuthService implements AuthRepository {
         permissions: permissions,
       );
 
-      return AuthSession(
+      return await _acceptSession(AuthSession(
         user: userModel,
         token: token,
         refreshToken: 'refresh_$uid',
         expiresAt: DateTime.now().add(const Duration(days: 30)),
         rememberMe: true,
-      );
+      ));
     } on FirebaseAuthException catch (e) {
       throw _handleAuthException(e);
     } catch (e) {
@@ -491,13 +575,14 @@ class FirebaseAuthService implements AuthRepository {
     String? securityCode,
     bool rememberMe = true,
   }) async {
+    WhiteLabelConfig.ensurePlatformAdminAllowed();
     if (!_isFirebaseReady) {
-      return _fallbackService.loginSuperAdmin(
+      return await _acceptSession(await _fallbackService.loginSuperAdmin(
         email: email,
         password: password,
         securityCode: securityCode,
         rememberMe: rememberMe,
-      );
+      ));
     }
 
     try {
@@ -555,13 +640,13 @@ class FirebaseAuthService implements AuthRepository {
       }
 
       final token = await fbUser.getIdToken() ?? 'token_$uid';
-      return AuthSession(
+      return await _acceptSession(AuthSession(
         user: userModel,
         token: token,
         refreshToken: 'refresh_$uid',
         expiresAt: DateTime.now().add(const Duration(days: 30)),
         rememberMe: rememberMe,
-      );
+      ));
     } on FirebaseAuthException catch (e) {
       throw _handleAuthException(e);
     } catch (e) {
@@ -596,40 +681,17 @@ class FirebaseAuthService implements AuthRepository {
       'manage_security_keys',
     ];
 
-    // 1. Cross-reference Tenants collection to see if this user owns/admins a gym
+    // 1. Cross-reference Tenants collection to see if this user owns/admins a gym.
+    // White-label builds only read the two tenant ids from the env file.
     try {
-      QuerySnapshot<Map<String, dynamic>>? snap;
-      snap = await firestore
-          .collection('tenants')
-          .where('adminEmail', isEqualTo: normalizedEmail)
-          .limit(1)
-          .get();
-      if (snap.docs.isEmpty) {
-        snap = await firestore
-            .collection('tenants')
-            .where('ownerEmail', isEqualTo: normalizedEmail)
-            .limit(1)
-            .get();
-      }
-      if (snap.docs.isEmpty) {
-        snap = await firestore
-            .collection('tenants')
-            .where('adminId', isEqualTo: uid)
-            .limit(1)
-            .get();
-      }
-      if (snap.docs.isEmpty) {
-        snap = await firestore
-            .collection('tenants')
-            .where('ownerId', isEqualTo: uid)
-            .limit(1)
-            .get();
-      }
+      final owned = await _findOwningTenant(
+        uid: uid,
+        normalizedEmail: normalizedEmail,
+      );
 
-      if (snap.docs.isNotEmpty) {
-        final tenantDoc = snap.docs.first;
-        final tenantData = tenantDoc.data();
-        final tenantId = tenantDoc.id;
+      if (owned != null) {
+        final tenantData = owned.data;
+        final tenantId = owned.id;
         final gymName = (tenantData['gymName'] as String?)?.trim() ?? 'Partner Gym';
         final resolvedName = (tenantData['adminName'] as String?)?.trim() ??
             (tenantData['ownerName'] as String?)?.trim() ??
@@ -871,12 +933,12 @@ class FirebaseAuthService implements AuthRepository {
     bool rememberMe = true,
   }) async {
     if (!_isFirebaseReady) {
-      return _fallbackService.login(
+      return await _acceptSession(await _fallbackService.login(
         email: email,
         password: password,
         requestedRole: requestedRole,
         rememberMe: rememberMe,
-      );
+      ));
     }
 
     try {
@@ -930,13 +992,13 @@ class FirebaseAuthService implements AuthRepository {
       }
 
       final token = await fbUser.getIdToken() ?? 'token_$uid';
-      return AuthSession(
+      return await _acceptSession(AuthSession(
         user: userModel,
         token: token,
         refreshToken: 'refresh_$uid',
         expiresAt: DateTime.now().add(const Duration(days: 30)),
         rememberMe: rememberMe,
-      );
+      ));
     } on FirebaseAuthException catch (e) {
       throw _handleAuthException(e);
     } catch (e) {
@@ -956,8 +1018,9 @@ class FirebaseAuthService implements AuthRepository {
     required String phone,
     SubscriptionTier tier = SubscriptionTier.growth,
   }) async {
+    WhiteLabelConfig.ensureGymCreationAllowed();
     if (!_isFirebaseReady) {
-      return _fallbackService.registerGymVendor(
+      return await _acceptSession(await _fallbackService.registerGymVendor(
         gymName: gymName,
         tradeLicense: tradeLicense,
         address: address,
@@ -966,7 +1029,7 @@ class FirebaseAuthService implements AuthRepository {
         password: password,
         phone: phone,
         tier: tier,
-      );
+      ));
     }
 
     try {
@@ -1053,13 +1116,13 @@ class FirebaseAuthService implements AuthRepository {
         ],
       );
 
-      return AuthSession(
+      return await _acceptSession(AuthSession(
         user: userModel,
         token: token,
         refreshToken: 'refresh_$uid',
         expiresAt: DateTime.now().add(const Duration(days: 30)),
         rememberMe: true,
-      );
+      ));
     } on FirebaseAuthException catch (e) {
       throw _handleAuthException(e);
     } catch (e) {
@@ -1077,17 +1140,27 @@ class FirebaseAuthService implements AuthRepository {
     required String gymCode,
   }) async {
     if (!_isFirebaseReady) {
-      return _fallbackService.registerMember(
+      return await _acceptSession(await _fallbackService.registerMember(
         fullName: fullName,
         email: email,
         password: password,
         phone: phone,
         gymCode: gymCode,
-      );
+      ));
     }
 
     try {
       final normalizedEmail = email.trim().toLowerCase();
+      _TenantHit? gym;
+      try {
+        gym = await _tenantForGymCode(gymCode);
+      } catch (e) {
+        if (WhiteLabelConfig.isRestricted) rethrow;
+      }
+      if (WhiteLabelConfig.isRestricted && gym == null) {
+        throw TenantAccessException('This gym code is not part of this gym app.');
+      }
+
       final userCred = await auth.createUserWithEmailAndPassword(
         email: normalizedEmail,
         password: password,
@@ -1103,21 +1176,10 @@ class FirebaseAuthService implements AuthRepository {
         await fbUser.updateDisplayName(fullName);
       } catch (_) {}
 
-      // Lookup gym by code
-      String gymName = 'GCRM Partner Gym';
-      String? tenantId;
-      try {
-        final querySnap = await firestore
-            .collection('tenants')
-            .where('gymCode', isEqualTo: gymCode.toUpperCase())
-            .limit(1)
-            .get();
-        if (querySnap.docs.isNotEmpty) {
-          final data = querySnap.docs.first.data();
-          gymName = data['gymName'] ?? gymName;
-          tenantId = querySnap.docs.first.id;
-        }
-      } catch (_) {}
+      final gymName = (gym?.data['gymName'] as String?)?.trim().isNotEmpty == true
+          ? gym!.data['gymName'] as String
+          : 'GCRM Partner Gym';
+      final String? tenantId = gym?.id;
 
       final userDoc = {
         'id': uid,
@@ -1152,13 +1214,13 @@ class FirebaseAuthService implements AuthRepository {
         permissions: const ['view_gym_pass', 'book_classes'],
       );
 
-      return AuthSession(
+      return await _acceptSession(AuthSession(
         user: userModel,
         token: token,
         refreshToken: 'refresh_$uid',
         expiresAt: DateTime.now().add(const Duration(days: 30)),
         rememberMe: true,
-      );
+      ));
     } on FirebaseAuthException catch (e) {
       throw _handleAuthException(e);
     } catch (e) {
@@ -1189,8 +1251,19 @@ class FirebaseAuthService implements AuthRepository {
             'No registered account found with this email address ($email). Please check the email or sign up.',
           );
         }
+        if (WhiteLabelConfig.isRestricted) {
+          final tenantId = querySnap.docs.first.data()['tenantId']?.toString();
+          WhiteLabelConfig.ensureAccount(tenantId);
+        }
+      } on TenantAccessException {
+        rethrow;
       } on FirebaseException catch (e) {
         debugPrint('Firestore read notice during password recovery: ${e.code}');
+        if (WhiteLabelConfig.isRestricted) {
+          throw TenantAccessException(
+            'Could not verify this account for this gym app.',
+          );
+        }
       }
 
       // 2. Dispatch password reset email via Firebase Authentication
@@ -1225,7 +1298,11 @@ class FirebaseAuthService implements AuthRepository {
   @override
   Future<AuthSession?> getCurrentSession() async {
     if (!_isFirebaseReady) {
-      return _fallbackService.getCurrentSession();
+      final session = await _fallbackService.getCurrentSession();
+      if (session == null || WhiteLabelConfig.allows(session.user.tenantId)) {
+        return session;
+      }
+      return null;
     }
 
     try {
@@ -1269,6 +1346,13 @@ class FirebaseAuthService implements AuthRepository {
         );
       }
 
+      if (!WhiteLabelConfig.allows(userModel.tenantId)) {
+        try {
+          await auth.signOut();
+        } catch (_) {}
+        return null;
+      }
+
       final token = await fbUser.getIdToken() ?? 'token_$uid';
       return AuthSession(
         user: userModel,
@@ -1299,6 +1383,18 @@ class FirebaseAuthService implements AuthRepository {
     }
 
     try {
+      if (WhiteLabelConfig.isRestricted) {
+        final tenants = <GymTenantModel>[];
+        for (final id in WhiteLabelConfig.allowedTenantIds) {
+          final hit = await _readTenant(id);
+          if (hit == null) continue;
+          final data = Map<String, dynamic>.from(hit.data);
+          data['id'] = hit.id;
+          tenants.add(GymTenantModel.fromJson(data));
+        }
+        return tenants;
+      }
+
       final snap = await firestore.collection('tenants').get();
       if (snap.docs.isEmpty) {
         return [];
@@ -3061,6 +3157,10 @@ class FirebaseAuthService implements AuthRepository {
     String sound = 'notification.mp3',
     String? sentByName,
   }) async {
+    WhiteLabelConfig.ensureBroadcast(
+      targetAudience: targetAudience,
+      targetTenantId: targetTenantId,
+    );
     if (!_isFirebaseReady) {
       return _fallbackService.sendSuperAdminPushNotification(
         title: title,
@@ -3151,6 +3251,29 @@ class FirebaseAuthService implements AuthRepository {
   }) async {
     final ids = <String>{};
 
+    if (WhiteLabelConfig.isRestricted) {
+      final tenantIds = targetAudience == 'specific_gym'
+          ? <String>[targetTenantId!.trim()]
+          : WhiteLabelConfig.allowedTenantIds;
+      for (final tid in tenantIds) {
+        if (!WhiteLabelConfig.allows(tid)) continue;
+        final usersSnap = await firestore
+            .collection('users')
+            .where('tenantId', isEqualTo: tid)
+            .get();
+        for (final doc in usersSnap.docs) {
+          if (doc.id.trim().isNotEmpty) ids.add(doc.id);
+        }
+        final hit = await _readTenant(tid);
+        if (hit == null) continue;
+        for (final key in ['adminId', 'ownerId']) {
+          final uid = hit.data[key]?.toString().trim() ?? '';
+          if (uid.isNotEmpty) ids.add(uid);
+        }
+      }
+      return ids.toList();
+    }
+
     void addDoc(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
       if (doc.id.trim().isNotEmpty) ids.add(doc.id);
     }
@@ -3210,16 +3333,20 @@ class FirebaseAuthService implements AuthRepository {
     return ids.toList();
   }
 
-  /// Writes a copy onto each recipient so the gym admin notification page can list it.
+  /// Writes one inbox document per recipient instead of appending to the user document.
   Future<void> _fanOutInboxEntries(List<String> userIds, Map<String, dynamic> entry) async {
+    final id = (entry['id']?.toString() ?? '').trim().replaceAll('/', '_');
+    if (id.isEmpty || userIds.isEmpty) return;
+    final payload = Map<String, dynamic>.from(entry);
+    payload['id'] = id;
     const chunkSize = 400;
     for (var i = 0; i < userIds.length; i += chunkSize) {
       final end = (i + chunkSize < userIds.length) ? i + chunkSize : userIds.length;
       final batch = firestore.batch();
       for (final uid in userIds.sublist(i, end)) {
         batch.set(
-          firestore.collection('users').doc(uid),
-          {'platformNotifications': FieldValue.arrayUnion([entry])},
+          firestore.collection('users').doc(uid).collection('notifications').doc(id),
+          payload,
           SetOptions(merge: true),
         );
       }
@@ -3227,29 +3354,54 @@ class FirebaseAuthService implements AuthRepository {
     }
   }
 
+  QueryDocumentSnapshot<Map<String, dynamic>>? _sentNotificationCursor;
+
   @override
-  Future<List<PushNotificationRecord>> getSentNotificationsHistory({int limit = 50}) async {
+  Future<SentNotificationPage> getSentNotificationsHistory({
+    int limit = SentNotificationPage.pageSize,
+    bool reset = true,
+  }) async {
+    final pageSize = limit.clamp(1, SentNotificationPage.pageSize).toInt();
     if (!_isFirebaseReady) {
-      return _fallbackService.getSentNotificationsHistory(limit: limit);
+      return _fallbackService.getSentNotificationsHistory(limit: pageSize, reset: reset);
     }
 
     try {
-      final snap = await firestore
+      if (reset) _sentNotificationCursor = null;
+      Query<Map<String, dynamic>> query = firestore
           .collection('notifications_queue')
           .orderBy('createdAt', descending: true)
-          .limit(limit)
-          .get();
+          .limit(pageSize);
+      if (!reset && _sentNotificationCursor != null) {
+        query = query.startAfterDocument(_sentNotificationCursor!);
+      }
+      final snap = await query.get();
 
       if (snap.docs.isEmpty) {
-        return _fallbackService.getSentNotificationsHistory(limit: limit);
+        if (!reset) {
+          return const SentNotificationPage(records: [], hasMore: false);
+        }
+        return await _fallbackService.getSentNotificationsHistory(limit: pageSize, reset: true);
       }
 
-      return snap.docs
-          .map((doc) => PushNotificationRecord.fromMap(doc.data(), docId: doc.id))
-          .toList();
+      _sentNotificationCursor = snap.docs.last;
+      return SentNotificationPage(
+        records: snap.docs
+            .map((doc) => PushNotificationRecord.fromMap(doc.data(), docId: doc.id))
+            .toList(),
+        hasMore: snap.docs.length >= pageSize,
+      );
     } catch (e) {
       debugPrint('Firestore getSentNotificationsHistory error: $e');
-      return _fallbackService.getSentNotificationsHistory(limit: limit);
+      return await _fallbackService.getSentNotificationsHistory(limit: pageSize, reset: reset);
     }
   }
+}
+
+/// One gym document read while resolving login or a gym code.
+class _TenantHit {
+  final String id;
+  final Map<String, dynamic> data;
+
+  _TenantHit(this.id, this.data);
 }

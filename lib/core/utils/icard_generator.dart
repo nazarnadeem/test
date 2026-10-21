@@ -730,24 +730,6 @@ class ICardGenerator {
     return pdf;
   }
 
-  /// Generates the I-Card PDF and opens the native printing/preview dialog.
-  static Future<void> generateAndPreviewICard({
-    required GymMemberModel member,
-    GymTenantModel? tenant,
-    String? customLogoUrl,
-  }) async {
-    final pdf = await generateICardDocument(
-      member: member,
-      tenant: tenant,
-      customLogoUrl: customLogoUrl,
-    );
-
-    await Printing.layoutPdf(
-      onLayout: (PdfPageFormat format) async => pdf.save(),
-      name: 'ICard_${member.firstName}_${member.lastName}.pdf',
-    );
-  }
-
   static pw.Widget _buildModernDetailRow({
     required String iconSvg,
     required String label,

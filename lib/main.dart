@@ -3,12 +3,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'core/config/white_label_config.dart';
 import 'core/services/notification_service.dart';
 import 'firebase_options.dart';
 import 'core/constants/app_strings.dart';
 import 'core/theme/app_theme.dart';
 import 'features/auth/data/repositories/auth_repository.dart';
 import 'features/auth/data/repositories/firebase_auth_service.dart';
+import 'features/auth/data/repositories/tenant_scoped_auth_repository.dart';
 import 'features/auth/controllers/auth_controller.dart';
 import 'features/auth/bloc/auth_bloc.dart';
 import 'features/auth/bloc/auth_event.dart';
@@ -27,6 +29,13 @@ void main() async {
     ),
   );
 
+  try {
+    await WhiteLabelConfig.load();
+  } on WhiteLabelConfigException catch (error) {
+    runApp(_WhiteLabelConfigErrorApp(message: error.message));
+    return;
+  }
+
   // Initialize Firebase and Push Notification Service
   try {
     await Firebase.initializeApp(
@@ -38,8 +47,33 @@ void main() async {
     debugPrint('Firebase/Notification initialization notice: $e');
   }
 
-  final authRepository = FirebaseAuthService();
+  final authRepository = TenantScopedAuthRepository(FirebaseAuthService());
   runApp(GcrmOneApp(authRepository: authRepository));
+}
+
+/// Shown when a white-label env file does not name two different gyms.
+class _WhiteLabelConfigErrorApp extends StatelessWidget {
+  final String message;
+
+  const _WhiteLabelConfigErrorApp({required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        body: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Center(
+            child: Text(
+              message,
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 /// Root Application Widget for GCRM One.
@@ -62,7 +96,10 @@ class _GcrmOneAppState extends State<GcrmOneApp> {
   @override
   void initState() {
     super.initState();
-    _repository = widget.authRepository ?? FirebaseAuthService();
+    final source = widget.authRepository ?? FirebaseAuthService();
+    _repository = source is TenantScopedAuthRepository
+        ? source
+        : TenantScopedAuthRepository(source);
     _authController = AuthController(authRepository: _repository);
   }
 

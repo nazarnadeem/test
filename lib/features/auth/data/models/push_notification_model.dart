@@ -111,3 +111,16 @@ class PushNotificationRecord extends Equatable {
         sentByName,
       ];
 }
+
+/// One page of Super Admin sent broadcasts. Each page is at most 10 queue documents.
+class SentNotificationPage {
+  static const pageSize = 10;
+
+  final List<PushNotificationRecord> records;
+  final bool hasMore;
+
+  const SentNotificationPage({
+    required this.records,
+    required this.hasMore,
+  });
+}

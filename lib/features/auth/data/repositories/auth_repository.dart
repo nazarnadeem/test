@@ -364,7 +364,11 @@ abstract class AuthRepository {
     String? sentByName,
   });
 
-  /// Fetch history of push notifications sent by Super Admin
-  Future<List<PushNotificationRecord>> getSentNotificationsHistory({int limit = 50});
+  /// Fetch one page of push notifications sent by Super Admin.
+  /// [limit] is capped at 10 so the history query cannot read the whole queue.
+  Future<SentNotificationPage> getSentNotificationsHistory({
+    int limit = SentNotificationPage.pageSize,
+    bool reset = true,
+  });
 }
 

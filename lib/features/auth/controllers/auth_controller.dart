@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import '../../../core/services/member_welcome_card.dart';
 import '../data/models/user_model.dart';
 import '../data/models/gym_tenant_model.dart';
 import '../data/models/platform_plan_model.dart';
@@ -76,6 +79,7 @@ class AuthController extends ChangeNotifier {
 
   // Super Admin Push Notifications
   List<PushNotificationRecord> _sentNotifications = [];
+  bool _hasMoreSentNotifications = false;
   bool _isLoadingNotifications = false;
   static const int maxBatchUploadLimit = 10;
 
@@ -126,6 +130,7 @@ class AuthController extends ChangeNotifier {
   bool get isGalleryFull => _galleryItems.length >= maxGalleryItemsLimit;
 
   List<PushNotificationRecord> get sentNotifications => _sentNotifications;
+  bool get hasMoreSentNotifications => _hasMoreSentNotifications;
   bool get isLoadingNotifications => _isLoadingNotifications;
 
   /// Resolves the active Gym Tenant model for the logged in user
@@ -665,6 +670,7 @@ class AuthController extends ChangeNotifier {
       _members = [saved, ..._members.where((m) => m.id != saved.id)];
       _lastMembersFetch = DateTime.now();
       notifyListeners();
+      unawaited(MemberWelcomeCard.sendQuietly(member: saved, tenant: currentGymTenant));
       return true;
     } catch (e) {
       _errorMessage = _cleanErrorMessage(e.toString());
@@ -1306,14 +1312,27 @@ class AuthController extends ChangeNotifier {
     }
   }
 
-  /// Load history of push notifications sent by Super Admin
-  Future<void> loadNotificationsHistory() async {
+  /// Load one page of push notifications sent by Super Admin.
+  Future<void> loadNotificationsHistory({bool reset = true}) async {
+    if (_isLoadingNotifications) return;
     _isLoadingNotifications = true;
     notifyListeners();
 
     try {
-      final history = await _authRepository.getSentNotificationsHistory();
-      _sentNotifications = List<PushNotificationRecord>.from(history);
+      final page = await _authRepository.getSentNotificationsHistory(
+        limit: SentNotificationPage.pageSize,
+        reset: reset,
+      );
+      if (reset) {
+        _sentNotifications = List<PushNotificationRecord>.from(page.records);
+      } else {
+        final seen = _sentNotifications.map((item) => item.id).toSet();
+        _sentNotifications = [
+          ..._sentNotifications,
+          ...page.records.where((item) => seen.add(item.id)),
+        ];
+      }
+      _hasMoreSentNotifications = page.hasMore;
     } catch (e) {
       debugPrint('Error loading notifications history: $e');
     } finally {

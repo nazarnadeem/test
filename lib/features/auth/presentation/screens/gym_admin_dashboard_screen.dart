@@ -1,14 +1,16 @@
 import 'dart:async';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../../../../core/constants/app_colors.dart';
 import '../../../../core/services/notification_service.dart';
 import '../../../../core/utils/image_optimizer.dart';
+import '../../../../core/utils/validators.dart';
 import '../../../../core/utils/video_optimizer.dart';
-import '../../../../core/utils/icard_generator.dart';
 import '../../../../core/widgets/custom_button.dart';
 import '../../../../core/widgets/custom_text_field.dart';
 import '../../controllers/auth_controller.dart';
@@ -38,6 +40,9 @@ typedef GymTrainerRecord = GymTeamMemberRecord;
 
 /// State-of-the-art Gym Admin / Facility Manager Dashboard Screen.
 class GymAdminDashboardScreen extends StatefulWidget {
+  /// Members Directory is the fourth tab in this dashboard.
+  static const membersTabIndex = 3;
+
   final AuthController authController;
 
   const GymAdminDashboardScreen({
@@ -83,15 +88,27 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
 
   // Push Notifications Listener & History
   StreamSubscription<PushNotificationAlert>? _notificationAlertSub;
+  StreamSubscription<String>? _openTabSub;
   final List<PushNotificationAlert> _receivedNotifications = [];
   final Set<String> _dismissedNotificationIds = {};
   int _unreadNotificationCount = 0;
   bool _isLoadingNotificationInbox = false;
+  bool _isLoadingMoreNotifications = false;
+  bool _hasMoreNotifications = false;
+  bool _isLoadingMoreMembers = false;
+  bool _noMoreMembers = false;
+  void Function(VoidCallback)? _refreshNotificationSheet;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 8, vsync: this);
+    final openMembers = NotificationService.hasPendingMembersTab;
+    _selectedTabIndex = openMembers ? GymAdminDashboardScreen.membersTabIndex : 0;
+    _tabController = TabController(
+      length: 9,
+      vsync: this,
+      initialIndex: _selectedTabIndex,
+    );
     _tabController.addListener(() {
       if (_tabController.indexIsChanging || _tabController.index != _selectedTabIndex) {
         setState(() {
@@ -123,16 +140,23 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
       );
     }
 
+    _openTabSub = NotificationService.onOpenTab.listen((tab) {
+      if (tab == PushNotificationAlert.membersTab) _openMembersTab();
+    });
+    if (openMembers) NotificationService.consumeMembersTabRequest();
+
     // Subscribe to incoming push notification alerts
     _notificationAlertSub = NotificationService.onNotificationAlert.listen((alert) {
       if (!mounted || _dismissedNotificationIds.contains(alert.id)) return;
       final alreadyListed = _receivedNotifications.any((item) => item.id == alert.id);
-      setState(() {
-        if (!alreadyListed) {
-          _receivedNotifications.insert(0, alert);
-        }
-        _unreadNotificationCount++;
-      });
+      if (!alert.isMembershipReminder) {
+        setState(() {
+          if (!alreadyListed) {
+            _receivedNotifications.insert(0, alert);
+          }
+          _unreadNotificationCount++;
+        });
+      }
       SystemSound.play(SystemSoundType.alert);
       HapticFeedback.heavyImpact();
       _showInAppNotificationBanner(alert);
@@ -141,7 +165,6 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _refreshOverviewData(forceRefresh: false);
-      _loadNotificationInbox();
     });
   }
 
@@ -154,21 +177,41 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     return tenantId;
   }
 
-  Future<void> _loadNotificationInbox() async {
+  Future<void> _loadNotificationInbox({bool reset = true}) async {
     final user = widget.authController.currentUser;
     if (user == null) return;
-    setState(() => _isLoadingNotificationInbox = true);
-    final alerts = await NotificationService.loadInbox(
+    if (!reset && (_isLoadingMoreNotifications || !_hasMoreNotifications)) return;
+    setState(() {
+      if (reset) {
+        _isLoadingNotificationInbox = true;
+      } else {
+        _isLoadingMoreNotifications = true;
+      }
+    });
+    _refreshNotificationSheet?.call(() {});
+    final page = await NotificationService.loadInbox(
       userId: user.id,
       tenantId: _gymTenantId(),
+      reset: reset,
     );
     if (!mounted) return;
     setState(() {
       final merged = <String, PushNotificationAlert>{
         for (final alert in _receivedNotifications)
-          if (!_dismissedNotificationIds.contains(alert.id)) alert.id: alert,
+          if (!alert.isMembershipReminder && !_dismissedNotificationIds.contains(alert.id))
+            alert.id: alert,
       };
-      for (final alert in alerts) {
+      if (reset) {
+        merged.clear();
+        for (final alert in _receivedNotifications) {
+          if (alert.isMembershipReminder) continue;
+          if (_dismissedNotificationIds.contains(alert.id)) continue;
+          if (page.alerts.any((item) => item.id == alert.id)) continue;
+          merged[alert.id] = alert;
+        }
+      }
+      for (final alert in page.alerts) {
+        if (alert.isMembershipReminder) continue;
         if (_dismissedNotificationIds.contains(alert.id)) continue;
         merged.putIfAbsent(alert.id, () => alert);
       }
@@ -177,8 +220,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
       _receivedNotifications
         ..clear()
         ..addAll(sorted);
+      _hasMoreNotifications = page.hasMore;
       _isLoadingNotificationInbox = false;
+      _isLoadingMoreNotifications = false;
     });
+    _refreshNotificationSheet?.call(() {});
   }
 
   Future<void> _refreshOverviewData({bool forceRefresh = false}) async {
@@ -200,6 +246,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     setState(() {
       _selectedMemberFilter = filterStatus;
       _expandedMemberId = null;
+      _noMoreMembers = false;
       if (filterStatus == 'Expiring') {
         _selectedExpiringFilter = '7D';
       }
@@ -223,10 +270,17 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   }
 
   Future<void> _fetchNextMembersPage() async {
-    await widget.authController.loadNextMembersPage();
-    if (mounted) {
+    if (_isLoadingMoreMembers || _noMoreMembers || !widget.authController.hasMoreMembers) return;
+    final before = _members.length;
+    setState(() => _isLoadingMoreMembers = true);
+    try {
+      await widget.authController.loadNextMembersPage();
+    } finally {
+      if (!mounted) return;
       setState(() {
         _members = List.from(widget.authController.members);
+        _isLoadingMoreMembers = false;
+        _noMoreMembers = _members.length == before || !widget.authController.hasMoreMembers;
       });
     }
   }
@@ -234,6 +288,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   @override
   void dispose() {
     _notificationAlertSub?.cancel();
+    _openTabSub?.cancel();
     NotificationService.stopRealtimeListener();
     _tabController.dispose();
     super.dispose();
@@ -256,6 +311,14 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     return null;
   }
 
+  void _openMembersTab() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    NotificationService.consumeMembersTabRequest();
+    if (_tabController.index == GymAdminDashboardScreen.membersTabIndex) return;
+    _tabController.animateTo(GymAdminDashboardScreen.membersTabIndex);
+  }
+
   void _showInAppNotificationBanner(PushNotificationAlert alert) {
     if (!mounted) return;
     final primaryColor = _resolveCurrentTenant()?.primaryColor ?? AppColors.primary;
@@ -271,7 +334,17 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
           side: BorderSide(color: primaryColor.withValues(alpha: 0.8), width: 1.5),
         ),
         duration: const Duration(seconds: 6),
-        content: Row(
+        action: alert.opensMembersTab
+            ? SnackBarAction(
+                label: 'View',
+                textColor: primaryColor,
+                onPressed: _openMembersTab,
+              )
+            : null,
+        content: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: alert.opensMembersTab ? _openMembersTab : null,
+          child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Container(
@@ -333,6 +406,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
             ),
           ],
         ),
+        ),
       ),
     );
   }
@@ -357,7 +431,9 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
       ),
       builder: (ctx) => StatefulBuilder(
-        builder: (context, setModalState) => SafeArea(
+        builder: (context, setModalState) {
+          _refreshNotificationSheet = setModalState;
+          return SafeArea(
           child: Container(
             constraints: BoxConstraints(
               maxHeight: MediaQuery.of(context).size.height * 0.75,
@@ -452,13 +528,64 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                             ],
                           ),
                         )
-                      : ListView.separated(
-                          itemCount: _receivedNotifications.length,
+                      : NotificationListener<ScrollNotification>(
+                          onNotification: (notification) {
+                            if (notification.metrics.axis != Axis.vertical) return false;
+                            final nearBottom = notification.metrics.pixels >=
+                                notification.metrics.maxScrollExtent - 160;
+                            if (nearBottom) _loadNotificationInbox(reset: false);
+                            return false;
+                          },
+                          child: ListView.separated(
+                          itemCount: _receivedNotifications.length + 1,
                           separatorBuilder: (_, __) => const SizedBox(height: 10),
                           itemBuilder: (_, index) {
+                            if (index >= _receivedNotifications.length) {
+                              if (_isLoadingMoreNotifications) {
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 16),
+                                  child: Center(
+                                    child: SizedBox(
+                                      width: 22,
+                                      height: 22,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: primaryColor,
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }
+                              if (!_hasMoreNotifications) {
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 16),
+                                  child: Center(
+                                    child: Text(
+                                      'No more data',
+                                      style: GoogleFonts.inter(
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                        color: Colors.white38,
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }
+                              return const SizedBox(height: 8);
+                            }
                             final alert = _receivedNotifications[index];
                             final timeStr = DateFormat('MMM dd, hh:mm a').format(alert.receivedAt);
-                            return Container(
+                            return Material(
+                              color: Colors.transparent,
+                              child: InkWell(
+                              borderRadius: BorderRadius.circular(12),
+                              onTap: alert.opensMembersTab
+                                  ? () {
+                                      Navigator.pop(context);
+                                      _openMembersTab();
+                                    }
+                                  : null,
+                              child: Container(
                               padding: const EdgeInsets.all(14),
                               decoration: BoxDecoration(
                                 color: const Color(0xFF151D2A),
@@ -500,16 +627,22 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                   ),
                                 ],
                               ),
-                            );
+                            ),
+                          ),
+                        );
                           },
                         ),
+                      ),
                 ),
               ],
             ),
           ),
-        ),
+        );
+        },
       ),
-    );
+    ).whenComplete(() {
+      _refreshNotificationSheet = null;
+    });
   }
 
   Future<void> _handleLogout() async {
@@ -1122,12 +1255,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                 CustomTextField(
                                   controller: phoneCtrl,
                                   label: 'Phone Number *',
-                                  hint: '+91 98765 43210',
+                                  hint: Validators.mobileHint,
                                   prefixIcon: Icons.phone_rounded,
-                                  keyboardType: TextInputType.phone,
-                                  validator: (v) => v == null || v.trim().isEmpty
-                                      ? 'Enter phone number'
-                                      : null,
+                                  keyboardType: TextInputType.number,
+                                  inputFormatters: Validators.mobileInputFormatters,
+                                  validator: Validators.phone,
                                 ),
                                 const SizedBox(height: 12),
                                 CustomTextField(
@@ -1304,9 +1436,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                       child: CustomTextField(
                                         controller: emergencyPhoneCtrl,
                                         label: 'Emergency Phone',
-                                        hint: '+91 91234 56789',
+                                        hint: Validators.mobileHint,
                                         prefixIcon: Icons.phone_callback_rounded,
-                                        keyboardType: TextInputType.phone,
+                                        keyboardType: TextInputType.number,
+                                        inputFormatters: Validators.mobileInputFormatters,
+                                        validator: Validators.optionalPhone,
                                       ),
                                     ),
                                     const SizedBox(width: 8),
@@ -2171,11 +2305,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   void _showEditMemberDialog(GymMemberRecord member, Color primaryColor) {
     final firstNameCtrl = TextEditingController(text: member.firstName);
     final lastNameCtrl = TextEditingController(text: member.lastName);
-    final phoneCtrl = TextEditingController(text: member.phone);
+    final phoneCtrl = TextEditingController(text: Validators.tenDigits(member.phone));
     final emailCtrl = TextEditingController(text: member.email);
     final addressCtrl = TextEditingController(text: member.address);
     final emergencyNameCtrl = TextEditingController(text: member.emergencyContactName ?? '');
-    final emergencyPhoneCtrl = TextEditingController(text: member.emergencyPhone ?? '');
+    final emergencyPhoneCtrl = TextEditingController(text: Validators.tenDigits(member.emergencyPhone));
     final weightCtrl = TextEditingController(
       text: member.weight != null ? (member.weight! % 1 == 0 ? member.weight!.toInt().toString() : member.weight!.toString()) : '',
     );
@@ -2716,12 +2850,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                 CustomTextField(
                                   controller: phoneCtrl,
                                   label: 'Phone Number *',
-                                  hint: '+91 98765 43210',
+                                  hint: Validators.mobileHint,
                                   prefixIcon: Icons.phone_rounded,
-                                  keyboardType: TextInputType.phone,
-                                  validator: (v) => v == null || v.trim().isEmpty
-                                      ? 'Enter phone number'
-                                      : null,
+                                  keyboardType: TextInputType.number,
+                                  inputFormatters: Validators.mobileInputFormatters,
+                                  validator: Validators.phone,
                                 ),
                                 const SizedBox(height: 12),
                                 CustomTextField(
@@ -2898,9 +3031,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                       child: CustomTextField(
                                         controller: emergencyPhoneCtrl,
                                         label: 'Emergency Phone',
-                                        hint: '+91 91234 56789',
+                                        hint: Validators.mobileHint,
                                         prefixIcon: Icons.phone_callback_rounded,
-                                        keyboardType: TextInputType.phone,
+                                        keyboardType: TextInputType.number,
+                                        inputFormatters: Validators.mobileInputFormatters,
+                                        validator: Validators.optionalPhone,
                                       ),
                                     ),
                                     const SizedBox(width: 8),
@@ -4042,7 +4177,6 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
 
     final primaryColor = tenant?.primaryColor ?? const Color(0xFFFF5722);
     final gymTitle = tenant?.gymName ?? (user?.gymName ?? 'IronPulse Fitness Club');
-    final adminName = user?.fullName ?? (tenant?.effectiveAdminName ?? 'Gym Admin');
     final gymCode = tenant?.gymCode ?? 'GYM-01';
 
     return Scaffold(
@@ -4065,7 +4199,6 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               // ──────── HEADER CONSOLE ────────
               _buildGymHeader(
                 gymName: gymTitle,
-                adminName: adminName,
                 gymCode: gymCode,
                 tenant: tenant,
                 primaryColor: primaryColor,
@@ -4102,6 +4235,9 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
 
                     // Tab 8: Facility & Subscription Plan Details
                     _buildFacilityTab(primaryColor, tenant),
+
+                    // Tab 9: WhatsApp delivery status
+                    _buildWhatsAppTab(primaryColor),
                   ],
                 ),
               ),
@@ -4221,7 +4357,6 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
 
   Widget _buildGymHeader({
     required String gymName,
-    required String adminName,
     required String gymCode,
     required GymTenantModel? tenant,
     required Color primaryColor,
@@ -4288,96 +4423,25 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Flexible(
-                          child: Text(
-                            gymName,
-                            style: GoogleFonts.poppins(
-                              fontSize: 16.5,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white,
-                              letterSpacing: -0.3,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            gradient: const LinearGradient(
-                              colors: [Color(0xFF8B5CF6), Color(0xFF6366F1)],
-                            ),
-                            borderRadius: BorderRadius.circular(6),
-                            boxShadow: [
-                              BoxShadow(
-                                color: const Color(0xFF8B5CF6).withValues(alpha: 0.4),
-                                blurRadius: 6,
-                              ),
-                            ],
-                          ),
-                          child: Text(
-                            'GYM ADMIN',
-                            style: GoogleFonts.inter(
-                              fontSize: 9,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white,
-                              letterSpacing: 0.4,
-                            ),
-                          ),
-                        ),
-                      ],
+                    Text(
+                      gymName,
+                      style: GoogleFonts.poppins(
+                        fontSize: 16.5,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                        letterSpacing: -0.3,
+                      ),
+                      overflow: TextOverflow.ellipsis,
                     ),
-                    const SizedBox(height: 3),
-                    Row(
-                      children: [
-                        Container(
-                          width: 7,
-                          height: 7,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: AppColors.success,
-                            boxShadow: [
-                              BoxShadow(
-                                color: AppColors.success.withValues(alpha: 0.8),
-                                blurRadius: 6,
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-                        Flexible(
-                          child: Text(
-                            'Manager: $adminName',
-                            style: GoogleFonts.inter(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w500,
-                              color: AppColors.textSecondaryDark,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                          decoration: BoxDecoration(
-                            color: primaryColor.withValues(alpha: 0.15),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            gymCode,
-                            style: GoogleFonts.inter(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w700,
-                              color: primaryColor,
-                            ),
-                          ),
-                        ),
-                      ],
+                    const SizedBox(height: 2),
+                    Text(
+                      gymCode,
+                      style: GoogleFonts.inter(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: primaryColor,
+                      ),
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                 ),
@@ -4598,9 +4662,24 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
           Tab(text: 'Team', icon: Icon(Icons.groups_2_rounded, size: 17)),
           Tab(text: 'Gallery', icon: Icon(Icons.photo_library_rounded, size: 17)),
           Tab(text: 'Facility', icon: Icon(Icons.store_rounded, size: 17)),
+          Tab(text: 'WhatsApp', icon: Icon(Icons.chat_rounded, size: 17)),
         ],
       ),
     );
+  }
+
+  Widget _buildWhatsAppTab(Color primaryColor) {
+    final tenantId = _gymTenantId();
+    if (tenantId == null || tenantId.trim().isEmpty) {
+      return Center(
+        child: Text(
+          'Sign in to a gym to see WhatsApp status.',
+          style: GoogleFonts.inter(color: AppColors.textSecondaryDark),
+        ),
+      );
+    }
+
+    return _WhatsAppStatusTab(tenantId: tenantId, primaryColor: primaryColor);
   }
 
   // ──────── TAB 1: OVERVIEW ────────
@@ -4664,6 +4743,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                     sub: activeMembers > 0 ? '$activeMembers active' : 'No members yet',
                     icon: Icons.groups_rounded,
                     color: primaryColor,
+                    stackIcon: true,
                   ),
                 ),
                 const SizedBox(width: 12),
@@ -4674,6 +4754,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                     sub: _recentCheckIns.isNotEmpty ? '${_recentCheckIns.length} recorded' : 'No entries yet',
                     icon: Icons.qr_code_scanner_rounded,
                     color: AppColors.accentCyan,
+                    stackIcon: true,
                   ),
                 ),
               ],
@@ -4822,6 +4903,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               )
             else
               ..._recentCheckIns.map((log) => _buildCheckInLogRow(log, primaryColor)),
+            const SizedBox(height: 40),
           ],
         ),
       ),
@@ -4834,6 +4916,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     required String sub,
     required IconData icon,
     required Color color,
+    bool stackIcon = false,
   }) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
@@ -4860,39 +4943,43 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Expanded(
-                child: Text(
-                  title,
-                  style: GoogleFonts.inter(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.textSecondaryDark,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                  maxLines: 1,
+          stackIcon
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildKpiIcon(icon, color),
+                    const SizedBox(height: 8),
+                    Text(
+                      title,
+                      style: GoogleFonts.inter(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.textSecondaryDark,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 2,
+                    ),
+                  ],
+                )
+              : Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: GoogleFonts.inter(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.textSecondaryDark,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    _buildKpiIcon(icon, color),
+                  ],
                 ),
-              ),
-              const SizedBox(width: 6),
-              Container(
-                width: 32,
-                height: 32,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [
-                      color.withValues(alpha: 0.25),
-                      color.withValues(alpha: 0.08),
-                    ],
-                  ),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: color.withValues(alpha: 0.5)),
-                ),
-                child: Icon(icon, size: 16, color: color),
-              ),
-            ],
-          ),
           const SizedBox(height: 10),
           FittedBox(
             fit: BoxFit.scaleDown,
@@ -4931,6 +5018,24 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
   }
 
+  Widget _buildKpiIcon(IconData icon, Color color) {
+    return Container(
+      width: 32,
+      height: 32,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            color.withValues(alpha: 0.25),
+            color.withValues(alpha: 0.08),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.5)),
+      ),
+      child: Icon(icon, size: 16, color: color),
+    );
+  }
+
   Widget _buildQuickActionButton({
     required String label,
     required IconData icon,
@@ -4961,7 +5066,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
             ),
           ],
         ),
-        child: Row(
+        child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Container(
@@ -4972,9 +5077,10 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               ),
               child: Icon(icon, color: color, size: 18),
             ),
-            const SizedBox(width: 10),
+            const SizedBox(height: 8),
             Text(
               label,
+              textAlign: TextAlign.center,
               style: GoogleFonts.poppins(
                 fontSize: 13,
                 fontWeight: FontWeight.w700,
@@ -5223,90 +5329,91 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header Row
+          // Header
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Row(
-                children: [
-                  Container(
-                    width: 34,
-                    height: 34,
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [
-                          primaryColor.withValues(alpha: 0.25),
-                          primaryColor.withValues(alpha: 0.08),
-                        ],
-                      ),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: primaryColor.withValues(alpha: 0.5)),
-                    ),
-                    child: Icon(Icons.auto_graph_rounded, color: primaryColor, size: 18),
-                  ),
-                  const SizedBox(width: 10),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'SALES & REVENUE',
-                        style: GoogleFonts.poppins(
-                          fontSize: 12.5,
-                          fontWeight: FontWeight.w800,
-                          color: Colors.white,
-                          letterSpacing: 0.6,
-                        ),
-                      ),
-                      Text(
-                        timeframeMetricLabel,
-                        style: GoogleFonts.inter(
-                          fontSize: 10.5,
-                          color: AppColors.textSecondaryDark,
-                        ),
-                      ),
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [
+                      primaryColor.withValues(alpha: 0.25),
+                      primaryColor.withValues(alpha: 0.08),
                     ],
                   ),
-                ],
-              ),
-              // Timeframe Toggle Pills
-              Container(
-                padding: const EdgeInsets.all(3),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0B1019),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: const Color(0xFF1D283A)),
+                  border: Border.all(color: primaryColor.withValues(alpha: 0.5)),
                 ),
-                child: Row(
-                  children: ['Week', 'Month', 'Year'].map((tf) {
-                    final isSel = _salesTimeframe == tf;
-                    return InkWell(
-                      onTap: () {
-                        setState(() {
-                          _salesTimeframe = tf;
-                          _selectedSalesPointIndex = null;
-                        });
-                      },
-                      borderRadius: BorderRadius.circular(8),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: isSel ? primaryColor : Colors.transparent,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          tf,
-                          style: GoogleFonts.inter(
-                            fontSize: 10.5,
-                            fontWeight: isSel ? FontWeight.w700 : FontWeight.w500,
-                            color: isSel ? Colors.white : AppColors.textSecondaryDark,
-                          ),
-                        ),
+                child: Icon(Icons.auto_graph_rounded, color: primaryColor, size: 18),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'SALES & REVENUE',
+                      style: GoogleFonts.poppins(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.white,
+                        letterSpacing: 0.6,
                       ),
-                    );
-                  }).toList(),
+                    ),
+                    Text(
+                      timeframeMetricLabel,
+                      style: GoogleFonts.inter(
+                        fontSize: 10.5,
+                        color: AppColors.textSecondaryDark,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 12),
+          // Timeframe filters sit under the header
+          Container(
+            padding: const EdgeInsets.all(3),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0B1019),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: const Color(0xFF1D283A)),
+            ),
+            child: Row(
+              children: ['Week', 'Month', 'Year'].map((tf) {
+                final isSel = _salesTimeframe == tf;
+                return Expanded(
+                  child: InkWell(
+                    onTap: () {
+                      setState(() {
+                        _salesTimeframe = tf;
+                        _selectedSalesPointIndex = null;
+                      });
+                    },
+                    borderRadius: BorderRadius.circular(8),
+                    child: Container(
+                      alignment: Alignment.center,
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: isSel ? primaryColor : Colors.transparent,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: Text(
+                        tf,
+                        style: GoogleFonts.inter(
+                          fontSize: 11,
+                          fontWeight: isSel ? FontWeight.w700 : FontWeight.w500,
+                          color: isSel ? Colors.white : AppColors.textSecondaryDark,
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }).toList(),
+            ),
           ),
           const SizedBox(height: 16),
 
@@ -5783,25 +5890,29 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: const Color(0xFF1F2B3E)),
               ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   Row(
                     children: [
                       const Icon(Icons.receipt_long_rounded, color: AppColors.accentViolet, size: 16),
                       const SizedBox(width: 8),
-                      Text(
-                        'Record Operational Expense',
-                        style: GoogleFonts.inter(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.white,
+                      Expanded(
+                        child: Text(
+                          'Record Operational Expense',
+                          style: GoogleFonts.inter(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
+                          ),
                         ),
                       ),
                     ],
                   ),
+                  const SizedBox(height: 10),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
                     decoration: BoxDecoration(
                       color: AppColors.accentViolet.withValues(alpha: 0.2),
                       borderRadius: BorderRadius.circular(6),
@@ -5809,7 +5920,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                     child: Text(
                       '+ Add Expense',
                       style: GoogleFonts.inter(
-                        fontSize: 10.5,
+                        fontSize: 11,
                         fontWeight: FontWeight.w700,
                         color: AppColors.accentViolet,
                       ),
@@ -5851,8 +5962,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
       return matchesQuery;
     }).toList();
 
-    final hasMore = widget.authController.hasMoreMembers;
-    final isLoadingMore = widget.authController.isLoadingMembers && _members.isNotEmpty;
+    final hasMore = widget.authController.hasMoreMembers && !_noMoreMembers;
 
     return Column(
       children: [
@@ -6034,68 +6144,186 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                 color: AppColors.textSecondaryDark),
                           ),
                         )
-                      : ListView.builder(
-                          padding: const EdgeInsets.symmetric(horizontal: 16),
-                          itemCount: filtered.length + (hasMore ? 1 : 0),
-                          itemBuilder: (context, idx) {
-                            if (idx == filtered.length) {
-                              return Container(
-                                margin: const EdgeInsets.only(top: 8, bottom: 24),
-                                padding: const EdgeInsets.all(12),
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFF131A26),
-                                  borderRadius: BorderRadius.circular(12),
-                                  border: Border.all(color: const Color(0xFF202C3E)),
-                                ),
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    Text(
-                                      'Page ${widget.authController.currentMembersPage} (20 per page)',
-                                      style: GoogleFonts.inter(
-                                        fontSize: 11.5,
-                                        fontWeight: FontWeight.w600,
-                                        color: AppColors.textSecondaryDark,
-                                      ),
-                                    ),
-                                    ElevatedButton.icon(
-                                      style: ElevatedButton.styleFrom(
-                                        backgroundColor: primaryColor,
-                                        foregroundColor: Colors.white,
-                                        padding: const EdgeInsets.symmetric(
-                                            horizontal: 14, vertical: 8),
-                                        shape: RoundedRectangleBorder(
-                                            borderRadius: BorderRadius.circular(8)),
-                                      ),
-                                      onPressed: isLoadingMore ? null : _fetchNextMembersPage,
-                                      icon: isLoadingMore
-                                          ? const SizedBox(
-                                              width: 14,
-                                              height: 14,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2,
-                                                color: Colors.white,
-                                              ),
-                                            )
-                                          : const Icon(Icons.arrow_forward_rounded, size: 16),
-                                      label: Text(
-                                        isLoadingMore ? 'Loading...' : 'Load Next 20',
-                                        style: GoogleFonts.inter(
-                                          fontSize: 11.5,
-                                          fontWeight: FontWeight.w700,
+                      : NotificationListener<ScrollNotification>(
+                          onNotification: (notification) {
+                            if (notification.metrics.axis != Axis.vertical) return false;
+                            final nearBottom = notification.metrics.pixels >=
+                                notification.metrics.maxScrollExtent - 160;
+                            if (nearBottom) _fetchNextMembersPage();
+                            return false;
+                          },
+                          child: ListView.builder(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            itemCount: filtered.length + 2,
+                            itemBuilder: (context, idx) {
+                              if (idx == filtered.length + 1) {
+                                return const SizedBox(height: 40);
+                              }
+                              if (idx == filtered.length) {
+                                if (_isLoadingMoreMembers) {
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 16),
+                                    child: Center(
+                                      child: SizedBox(
+                                        width: 22,
+                                        height: 22,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: primaryColor,
                                         ),
                                       ),
                                     ),
-                                  ],
-                                ),
-                              );
-                            }
-                            final member = filtered[idx];
-                            return _buildMemberCard(member, primaryColor);
-                          },
+                                  );
+                                }
+                                if (!hasMore) {
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 16),
+                                    child: Center(
+                                      child: Text(
+                                        'No more data',
+                                        style: GoogleFonts.inter(
+                                          fontSize: 12.5,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.white38,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                }
+                                return const SizedBox(height: 8);
+                              }
+                              final member = filtered[idx];
+                              return _buildMemberCard(member, primaryColor);
+                            },
+                          ),
                         ))),
         ),
       ],
+    );
+  }
+
+  Future<void> _openDialer(String rawNumber) async {
+    final cleaned = rawNumber.replaceAll(RegExp(r'[^\d+]'), '');
+    if (cleaned.isEmpty) return;
+    final uri = Uri(scheme: 'tel', path: cleaned);
+    var opened = false;
+    try {
+      opened = await launchUrl(uri);
+    } catch (_) {
+      opened = false;
+    }
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Could not open the dialer for $rawNumber',
+            style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+          ),
+          backgroundColor: AppColors.error,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Widget _buildDialableContact({
+    required IconData icon,
+    required String number,
+    required Color color,
+    VoidCallback? onTap,
+  }) {
+    return InkWell(
+      onTap: onTap ?? () => _openDialer(number),
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 2),
+        child: Row(
+          children: [
+            Icon(icon, size: 14, color: color),
+            const SizedBox(width: 4),
+            Expanded(
+              child: Text(
+                number,
+                style: GoogleFonts.inter(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMemberChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Text(
+        label,
+        style: GoogleFonts.inter(
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          color: color,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMemberMetaTile({
+    required IconData icon,
+    required String label,
+    required String value,
+    required Color color,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF101724),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF1D283A)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label.toUpperCase(),
+                  style: GoogleFonts.inter(
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.6,
+                    color: AppColors.textSecondaryDark,
+                  ),
+                ),
+                const SizedBox(height: 1),
+                Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.inter(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -6103,11 +6331,26 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     final isExpanded = _expandedMemberId == member.id;
     final isExp = member.isExpiringSoon;
     final isExpired = member.isExpired;
-    final statusColor = !member.isActive
-        ? Colors.white54
-        : (isExpired
-            ? AppColors.error
-            : (isExp ? AppColors.accentAmber : AppColors.success));
+    final statusColor = member.isLifetimeFree
+        ? AppColors.accentViolet
+        : (!member.isActive
+            ? Colors.white54
+            : (isExpired
+                ? AppColors.error
+                : (isExp ? AppColors.accentAmber : AppColors.success)));
+    final statusLabel = member.isLifetimeFree
+        ? 'Lifetime'
+        : (!member.isActive
+            ? 'Inactive'
+            : (isExpired
+                ? 'Expired'
+                : (member.daysRemaining == 0 ? 'Expires today' : '${member.daysRemaining}d left')));
+    final planLabel = member.isLifetimeFree ? 'VIP Lifetime Free' : member.membershipPlan;
+    final hasBatch = member.batchName != null && member.batchName!.trim().isNotEmpty;
+    final batchLabel = hasBatch ? member.batchName! : 'Unassigned';
+    final memberPhone = member.phone.trim();
+    final emergencyPhone = member.emergencyPhone?.trim() ?? '';
+    final demoLabel = member.age != null ? '${member.gender} · ${member.age}' : member.gender;
 
     return AnimatedContainer(
       duration: const Duration(milliseconds: 240),
@@ -6123,27 +6366,14 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
         ),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
-          color: isExpanded
-              ? primaryColor.withValues(alpha: 0.6)
-              : (!member.isActive
-                  ? const Color(0xFF223047)
-                  : (isExpired
-                      ? AppColors.error.withValues(alpha: 0.6)
-                      : (isExp
-                          ? AppColors.accentAmber.withValues(alpha: 0.6)
-                          : const Color(0xFF223047)))),
-          width: isExpanded ? 1.5 : ((member.isActive && (isExp || isExpired)) ? 1.4 : 1),
+          color: isExpanded ? primaryColor.withValues(alpha: 0.55) : const Color(0xFF223047),
+          width: isExpanded ? 1.4 : 1,
         ),
         boxShadow: [
           BoxShadow(
-            color: (isExpanded
-                    ? primaryColor
-                    : (!member.isActive
-                        ? Colors.black
-                        : (isExpired ? AppColors.error : (isExp ? AppColors.accentAmber : Colors.black))))
-                .withValues(alpha: isExpanded ? 0.18 : ((member.isActive && (isExp || isExpired)) ? 0.15 : 0.2)),
-            blurRadius: isExpanded ? 14 : 10,
-            offset: const Offset(0, 4),
+            color: Colors.black.withValues(alpha: 0.22),
+            blurRadius: 8,
+            offset: const Offset(0, 3),
           ),
         ],
       ),
@@ -6165,279 +6395,165 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // ── HEADER: Avatar + Name/Phone + Status Pill + I-Card + Expand Chevron ──
+                // Avatar, name, and status stay on separate lines so nothing is crushed.
                 Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Member Avatar with status indicator ring
                     Stack(
                       clipBehavior: Clip.none,
                       children: [
                         Container(
-                          width: 44,
-                          height: 44,
+                          width: 48,
+                          height: 48,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
                             color: const Color(0xFF192231),
-                            border: Border.all(
-                              color: (member.isActive && (isExp || isExpired))
-                                  ? statusColor
-                                  : primaryColor.withValues(alpha: 0.7),
-                              width: 1.5,
-                            ),
+                            border: Border.all(color: statusColor.withValues(alpha: 0.8), width: 1.5),
                           ),
-                            child: ClipOval(
-                              child: ImageOptimizer.buildImageWidget(
-                                member.photoUrl,
-                                fit: BoxFit.cover,
-                                primaryColor: primaryColor,
-                                placeholder: Center(
-                                  child: Text(
-                                    member.fullName.isNotEmpty ? member.fullName[0].toUpperCase() : 'M',
-                                    style: GoogleFonts.poppins(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w800,
-                                      color: primaryColor,
-                                    ),
+                          child: ClipOval(
+                            child: ImageOptimizer.buildImageWidget(
+                              member.photoUrl,
+                              fit: BoxFit.cover,
+                              primaryColor: primaryColor,
+                              placeholder: Center(
+                                child: Text(
+                                  member.fullName.isNotEmpty ? member.fullName[0].toUpperCase() : 'M',
+                                  style: GoogleFonts.poppins(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.w800,
+                                    color: primaryColor,
                                   ),
                                 ),
                               ),
                             ),
                           ),
-                          Positioned(
-                            bottom: 0,
-                            right: 0,
-                            child: Container(
-                              width: 12,
-                              height: 12,
-                              decoration: BoxDecoration(
-                                color: member.isLifetimeFree
-                                    ? AppColors.accentViolet
-                                    : (!member.isActive ? Colors.white38 : statusColor),
-                                shape: BoxShape.circle,
-                                border: Border.all(color: const Color(0xFF131B27), width: 2),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(width: 10),
-                      // Full Name & Demographics + Phone
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Flexible(
-                                  child: Text(
-                                    member.fullName,
-                                    style: GoogleFonts.poppins(
-                                      fontSize: 14.5,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                const SizedBox(width: 6),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white10,
-                                    borderRadius: BorderRadius.circular(6),
-                                  ),
-                                  child: Text(
-                                    member.age != null ? '${member.gender} • ${member.age}y' : member.gender,
-                                    style: GoogleFonts.inter(
-                                      fontSize: 9.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: Colors.white70,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 2),
-                            Row(
-                              children: [
-                                const Icon(Icons.phone_rounded, size: 11, color: AppColors.textSecondaryDark),
-                                const SizedBox(width: 4),
-                                Flexible(
-                                  child: Text(
-                                    member.phone.isNotEmpty ? member.phone : member.email,
-                                    style: GoogleFonts.inter(
-                                      fontSize: 11,
-                                      color: AppColors.textSecondaryDark,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
                         ),
-                      ),
-                      // Status Pill + I-Card + Expand Chevron
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3.5),
+                        Positioned(
+                          bottom: 0,
+                          right: 0,
+                          child: Container(
+                            width: 12,
+                            height: 12,
                             decoration: BoxDecoration(
-                              color: member.isLifetimeFree
-                                  ? AppColors.accentViolet.withValues(alpha: 0.2)
-                                  : (!member.isActive
-                                      ? Colors.white10
-                                      : statusColor.withValues(alpha: 0.18)),
-                              borderRadius: BorderRadius.circular(7),
-                              border: Border.all(
-                                color: member.isLifetimeFree
-                                    ? AppColors.accentViolet.withValues(alpha: 0.5)
-                                    : (!member.isActive
-                                        ? Colors.white24
-                                        : statusColor.withValues(alpha: 0.4)),
-                              ),
+                              color: statusColor,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: const Color(0xFF131B27), width: 2),
                             ),
-                            child: Text(
-                              member.isLifetimeFree
-                                  ? '♾️ Lifetime Free'
-                                  : (!member.isActive
-                                      ? 'Inactive'
-                                      : (isExpired
-                                          ? 'Expired'
-                                          : (isExp
-                                              ? (member.daysRemaining == 0
-                                                  ? 'Expiring Today'
-                                                  : 'Expiring (${member.daysRemaining}d)')
-                                              : 'Active (${member.daysRemaining}d)'))),
-                              style: GoogleFonts.inter(
-                                fontSize: 10,
-                                fontWeight: FontWeight.w700,
-                                color: member.isLifetimeFree
-                                    ? AppColors.accentViolet
-                                    : (!member.isActive ? Colors.white60 : statusColor),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 2),
-                          IconButton(
-                            icon: const Icon(Icons.badge_outlined, color: Colors.white70, size: 20),
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                            tooltip: 'Generate I-Card',
-                            onPressed: () {
-                              final tenant = _resolveCurrentTenant();
-                              ICardGenerator.generateAndPreviewICard(
-                                member: member,
-                                tenant: tenant,
-                              );
-                            },
-                          ),
-                          const SizedBox(width: 2),
-                          AnimatedRotation(
-                            turns: isExpanded ? 0.5 : 0.0,
-                            duration: const Duration(milliseconds: 220),
-                            child: Container(
-                              padding: const EdgeInsets.all(4),
-                              decoration: BoxDecoration(
-                                color: isExpanded
-                                    ? primaryColor.withValues(alpha: 0.2)
-                                    : Colors.white.withValues(alpha: 0.06),
-                                shape: BoxShape.circle,
-                              ),
-                              child: Icon(
-                                Icons.keyboard_arrow_down_rounded,
-                                size: 18,
-                                color: isExpanded ? primaryColor : Colors.white60,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-
-                  // ── IMPORTANT COLLAPSED INFO STRIP: Plan & Batch Strip ──
-                  const SizedBox(height: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF101724),
-                      borderRadius: BorderRadius.circular(9),
-                      border: Border.all(color: const Color(0xFF1D283A)),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          member.isLifetimeFree
-                              ? Icons.all_inclusive_rounded
-                              : Icons.workspace_premium_rounded,
-                          size: 13,
-                          color: member.isLifetimeFree ? AppColors.accentViolet : primaryColor,
-                        ),
-                        const SizedBox(width: 5),
-                        Flexible(
-                          child: Text(
-                            member.isLifetimeFree ? 'Plan: VIP Lifetime Free' : 'Plan: ${member.membershipPlan}',
-                            style: GoogleFonts.inter(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                              color: Colors.white,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                        if (member.hasDiscount) ...[
-                          const SizedBox(width: 5),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                            decoration: BoxDecoration(
-                              color: AppColors.accentEmerald.withValues(alpha: 0.18),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Text(
-                              '🏷️ ${member.formattedDiscount}',
-                              style: GoogleFonts.inter(
-                                fontSize: 9,
-                                fontWeight: FontWeight.w700,
-                                color: AppColors.accentEmerald,
-                              ),
-                            ),
-                          ),
-                        ],
-                        const SizedBox(width: 8),
-                        Container(
-                          width: 1,
-                          height: 12,
-                          color: Colors.white12,
-                        ),
-                        const SizedBox(width: 8),
-                        Icon(
-                          Icons.schedule_rounded,
-                          size: 12,
-                          color: member.batchName != null && member.batchName!.isNotEmpty
-                              ? AppColors.accentCyan
-                              : Colors.white38,
-                        ),
-                        const SizedBox(width: 4),
-                        Flexible(
-                          child: Text(
-                            member.batchName != null && member.batchName!.isNotEmpty
-                                ? 'Batch: ${member.batchName}'
-                                : 'Batch: Unassigned',
-                            style: GoogleFonts.inter(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w600,
-                              color: member.batchName != null && member.batchName!.isNotEmpty
-                                  ? AppColors.accentCyan
-                                  : Colors.white38,
-                            ),
-                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
                       ],
                     ),
-                  ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            member.fullName,
+                            style: GoogleFonts.poppins(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white,
+                              height: 1.2,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          if (memberPhone.isNotEmpty || emergencyPhone.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Row(
+                              children: [
+                                if (memberPhone.isNotEmpty)
+                                  Expanded(
+                                    child: _buildDialableContact(
+                                      icon: Icons.phone_rounded,
+                                      number: memberPhone,
+                                      color: AppColors.accentCyan,
+                                    ),
+                                  ),
+                                if (memberPhone.isNotEmpty && emergencyPhone.isNotEmpty)
+                                  const SizedBox(width: 10),
+                                if (emergencyPhone.isNotEmpty)
+                                  Expanded(
+                                    child: _buildDialableContact(
+                                      icon: Icons.emergency_rounded,
+                                      number: emergencyPhone,
+                                      color: AppColors.accentAmber,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ] else if (member.email.trim().isNotEmpty) ...[
+                            const SizedBox(height: 3),
+                            Text(
+                              member.email.trim(),
+                              style: GoogleFonts.inter(
+                                fontSize: 12,
+                                color: AppColors.textSecondaryDark,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                          const SizedBox(height: 8),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              _buildMemberChip(statusLabel, statusColor),
+                              _buildMemberChip(demoLabel, Colors.white70),
+                              if (member.hasDiscount)
+                                _buildMemberChip(member.formattedDiscount, AppColors.accentEmerald),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    AnimatedRotation(
+                      turns: isExpanded ? 0.5 : 0.0,
+                      duration: const Duration(milliseconds: 220),
+                      child: Container(
+                        padding: const EdgeInsets.all(4),
+                        decoration: BoxDecoration(
+                          color: isExpanded
+                              ? primaryColor.withValues(alpha: 0.2)
+                              : Colors.white.withValues(alpha: 0.06),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          Icons.keyboard_arrow_down_rounded,
+                          size: 18,
+                          color: isExpanded ? primaryColor : Colors.white60,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _buildMemberMetaTile(
+                        icon: member.isLifetimeFree
+                            ? Icons.all_inclusive_rounded
+                            : Icons.workspace_premium_rounded,
+                        label: 'Plan',
+                        value: planLabel,
+                        color: member.isLifetimeFree ? AppColors.accentViolet : primaryColor,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: _buildMemberMetaTile(
+                        icon: Icons.schedule_rounded,
+                        label: 'Batch',
+                        value: batchLabel,
+                        color: hasBatch ? AppColors.accentCyan : Colors.white38,
+                      ),
+                    ),
+                  ],
+                ),
 
                   // ── EXPANDED DETAILS (Only revealed when isExpanded) ──
                   if (isExpanded) ...[
@@ -7401,9 +7517,11 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                             CustomTextField(
                               controller: phoneCtrl,
                               label: 'Phone Number',
-                              hint: '+91 98765 43210',
+                              hint: Validators.mobileHint,
                               prefixIcon: Icons.phone_rounded,
-                              keyboardType: TextInputType.phone,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: Validators.mobileInputFormatters,
+                              validator: Validators.optionalPhone,
                             ),
                             const SizedBox(height: 12),
                             CustomTextField(
@@ -7478,28 +7596,15 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                                         fullName: nameCtrl.text.trim(),
                                         role: selectedRole,
                                         gender: selectedRole == GymTeamRole.trainer ? selectedGender : null,
-                                        experience: selectedRole == GymTeamRole.trainer
-                                            ? (expCtrl.text.trim().isNotEmpty
-                                                ? expCtrl.text.trim()
-                                                : '3+ Years Exp')
+                                        experience: selectedRole == GymTeamRole.trainer &&
+                                                expCtrl.text.trim().isNotEmpty
+                                            ? expCtrl.text.trim()
                                             : null,
-                                        specialty: selectedRole == GymTeamRole.owner
-                                            ? 'Gym Owner'
-                                            : (specialtyCtrl.text.trim().isNotEmpty
-                                                ? specialtyCtrl.text.trim()
-                                                : (selectedRole == GymTeamRole.trainer
-                                                    ? 'Strength & Conditioning'
-                                                    : 'Operations & Management')),
-                                        phone: phoneCtrl.text.trim().isNotEmpty
-                                            ? phoneCtrl.text.trim()
-                                            : '+91 98765 43210',
-                                        email: emailCtrl.text.trim().isNotEmpty
-                                            ? emailCtrl.text.trim()
-                                            : '${nameCtrl.text.trim().toLowerCase().replaceAll(' ', '.')}@facility.com',
+                                        specialty: specialtyCtrl.text.trim(),
+                                        phone: phoneCtrl.text.trim(),
+                                        email: emailCtrl.text.trim(),
                                         isOnDuty: isOnDuty,
                                         imageBytes: selectedAvatarBytes,
-                                        activeClientsCount: selectedRole == GymTeamRole.trainer ? 10 : 0,
-                                        rating: 4.95,
                                         createdAt: DateTime.now(),
                                       );
 
@@ -8677,6 +8782,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   return _buildBatchCard(batch, primaryColor);
                 },
               ),
+            const SizedBox(height: 40),
           ],
         ),
       ),
@@ -9665,6 +9771,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   sub: 'Tiers available',
                   icon: Icons.card_membership_rounded,
                   color: primaryColor,
+                  stackIcon: true,
                 ),
               ),
               const SizedBox(width: 12),
@@ -9675,6 +9782,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                   sub: 'Subscribed users',
                   icon: Icons.people_alt_rounded,
                   color: AppColors.accentCyan,
+                  stackIcon: true,
                 ),
               ),
             ],
@@ -9859,6 +9967,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               final count = enrolledCountByPlan[plan.id] ?? plan.enrolledMembersCount;
               return _buildPlanCard(plan, primaryColor, count);
             }),
+          const SizedBox(height: 40),
         ],
       ),
     );
@@ -10714,6 +10823,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
             )
           else
             ...filteredExpenses.map((exp) => _buildExpenseCard(exp, primaryColor)),
+          const SizedBox(height: 40),
         ],
       ),
     );
@@ -11507,8 +11617,9 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                 )
               : ListView.builder(
                   padding: const EdgeInsets.all(16),
-                  itemCount: filteredTeam.length,
+                  itemCount: filteredTeam.length + 1,
                   itemBuilder: (context, idx) {
+                    if (idx >= filteredTeam.length) return const SizedBox(height: 40);
                     final member = filteredTeam[idx];
                     return _buildTeamMemberCard(member, primaryColor);
                   },
@@ -11586,7 +11697,52 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
     );
   }
 
+  static const _placeholderTeamSpecialties = {
+    'Gym Owner',
+    'Strength & Conditioning',
+    'Operations & Management',
+  };
+
+  String _realTeamEmail(String email) {
+    final trimmed = email.trim();
+    if (trimmed.isEmpty || trimmed.toLowerCase().endsWith('@facility.com')) {
+      return '';
+    }
+    return trimmed;
+  }
+
+  Future<void> _openMail(String email) async {
+    final uri = Uri(scheme: 'mailto', path: email.trim());
+    var opened = false;
+    try {
+      opened = await launchUrl(uri);
+    } catch (_) {
+      opened = false;
+    }
+    if (!opened && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Could not open mail for $email',
+            style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+          ),
+          backgroundColor: AppColors.error,
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
   Widget _buildTeamMemberCard(GymTeamMemberRecord member, Color primaryColor) {
+    final teamPhone = member.phone.trim();
+    final teamEmail = _realTeamEmail(member.email);
+    final specialty = member.specialty.trim();
+    final showTeamSpecialty = specialty.isNotEmpty && !_placeholderTeamSpecialties.contains(specialty);
+    final teamGender = member.isTrainer ? (member.gender?.trim() ?? '') : '';
+    final experience = member.experience?.trim() ?? '';
+    final teamExperience =
+        member.isTrainer && experience.isNotEmpty && experience != '3+ Years Exp' ? experience : '';
+
     return Container(
       margin: const EdgeInsets.only(bottom: 12),
       padding: const EdgeInsets.all(16),
@@ -11599,18 +11755,13 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
             Color(0xFF0F1522),
           ],
         ),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(
-          color: member.role == GymTeamRole.owner
-              ? const Color(0xFFA855F7).withValues(alpha: 0.45)
-              : const Color(0xFF223047),
-          width: member.role == GymTeamRole.owner ? 1.4 : 1,
-        ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFF223047)),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.25),
-            blurRadius: 10,
-            offset: const Offset(0, 4),
+            color: Colors.black.withValues(alpha: 0.22),
+            blurRadius: 8,
+            offset: const Offset(0, 3),
           ),
         ],
       ),
@@ -11674,15 +11825,12 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                     ),
                   ),
                   Container(
-                    padding: const EdgeInsets.all(3.5),
+                    width: 12,
+                    height: 12,
                     decoration: BoxDecoration(
-                      color: member.role.color,
+                      color: member.isOnDuty ? AppColors.success : Colors.white38,
                       shape: BoxShape.circle,
-                    ),
-                    child: Icon(
-                      member.role.icon,
-                      size: 10,
-                      color: Colors.black,
+                      border: Border.all(color: const Color(0xFF141D2B), width: 2),
                     ),
                   ),
                 ],
@@ -11694,206 +11842,71 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Flexible(
-                          child: Text(
-                            member.fullName,
-                            style: GoogleFonts.poppins(
-                              fontSize: 15.5,
-                              fontWeight: FontWeight.w800,
-                              color: Colors.white,
-                              letterSpacing: -0.3,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-
-                        // Role Badge
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: member.role.color.withValues(alpha: 0.2),
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(
-                              color: member.role.color.withValues(alpha: 0.5),
-                              width: 1,
-                            ),
-                          ),
-                          child: Text(
-                            member.role.badgeLabel,
-                            style: GoogleFonts.inter(
-                              fontSize: 9.5,
-                              fontWeight: FontWeight.w800,
-                              color: member.role.color,
-                              letterSpacing: 0.4,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 6),
-
-                        // Duty Status Badge
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 6,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: member.isOnDuty
-                                ? AppColors.success.withValues(alpha: 0.15)
-                                : const Color(0xFF222B3C),
-                            borderRadius: BorderRadius.circular(6),
-                            border: Border.all(
-                              color: member.isOnDuty
-                                  ? AppColors.success.withValues(alpha: 0.3)
-                                  : Colors.transparent,
-                            ),
-                          ),
-                          child: Text(
-                            member.isOnDuty ? 'ON DUTY' : 'OFF DUTY',
-                            style: GoogleFonts.inter(
-                              fontSize: 9,
-                              fontWeight: FontWeight.w700,
-                              color: member.isOnDuty
-                                  ? AppColors.success
-                                  : AppColors.textMutedDark,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 3),
-
-                    // Specialty / Department
                     Text(
-                      member.specialty,
-                      style: GoogleFonts.inter(
-                        fontSize: 12,
-                        color: AppColors.textSecondaryDark,
+                      member.fullName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: GoogleFonts.poppins(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.white,
+                        height: 1.2,
                       ),
                     ),
-
-                    // Trainer Badges (Gender & Experience)
-                    if (member.isTrainer) ...[
-                      const SizedBox(height: 6),
-                      Wrap(
-                        spacing: 6,
-                        runSpacing: 4,
+                    if (showTeamSpecialty) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        member.specialty.trim(),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.inter(
+                          fontSize: 12,
+                          color: AppColors.textSecondaryDark,
+                        ),
+                      ),
+                    ],
+                    if (teamPhone.isNotEmpty || teamEmail.isNotEmpty) ...[
+                      const SizedBox(height: 4),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          if (member.gender != null && member.gender!.isNotEmpty)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 2.5,
-                              ),
-                              decoration: BoxDecoration(
-                                color: (member.gender == 'Female'
-                                        ? const Color(0xFFF472B6)
-                                        : (member.gender == 'Male'
-                                            ? AppColors.accentCyan
-                                            : AppColors.accentAmber))
-                                    .withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(6),
-                                border: Border.all(
-                                  color: (member.gender == 'Female'
-                                          ? const Color(0xFFF472B6)
-                                          : (member.gender == 'Male'
-                                              ? AppColors.accentCyan
-                                              : AppColors.accentAmber))
-                                      .withValues(alpha: 0.3),
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(
-                                    member.gender == 'Female'
-                                        ? Icons.female_rounded
-                                        : (member.gender == 'Male'
-                                            ? Icons.male_rounded
-                                            : Icons.transgender_rounded),
-                                    size: 12,
-                                    color: member.gender == 'Female'
-                                        ? const Color(0xFFF472B6)
-                                        : (member.gender == 'Male'
-                                            ? AppColors.accentCyan
-                                            : AppColors.accentAmber),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    member.gender!,
-                                    style: GoogleFonts.inter(
-                                      fontSize: 10.5,
-                                      fontWeight: FontWeight.w700,
-                                      color: member.gender == 'Female'
-                                          ? const Color(0xFFF472B6)
-                                          : (member.gender == 'Male'
-                                              ? AppColors.accentCyan
-                                              : AppColors.accentAmber),
-                                    ),
-                                  ),
-                                ],
-                              ),
+                          if (teamPhone.isNotEmpty)
+                            _buildDialableContact(
+                              icon: Icons.phone_rounded,
+                              number: teamPhone,
+                              color: AppColors.accentCyan,
                             ),
-                          if (member.experience != null && member.experience!.isNotEmpty)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 2.5,
-                              ),
-                              decoration: BoxDecoration(
-                                color: AppColors.accentAmber.withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(6),
-                                border: Border.all(
-                                  color: AppColors.accentAmber.withValues(alpha: 0.3),
-                                ),
-                              ),
-                              child: Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  const Icon(
-                                    Icons.work_history_rounded,
-                                    size: 12,
-                                    color: AppColors.accentAmber,
-                                  ),
-                                  const SizedBox(width: 4),
-                                  Text(
-                                    member.experience!,
-                                    style: GoogleFonts.inter(
-                                      fontSize: 10.5,
-                                      fontWeight: FontWeight.w700,
-                                      color: AppColors.accentAmber,
-                                    ),
-                                  ),
-                                ],
-                              ),
+                          if (teamEmail.isNotEmpty)
+                            _buildDialableContact(
+                              icon: Icons.email_outlined,
+                              number: teamEmail,
+                              color: AppColors.textSecondaryDark,
+                              onTap: () => _openMail(teamEmail),
                             ),
                         ],
                       ),
                     ],
-
-                    const SizedBox(height: 6),
-                    // Metrics or Contact details
-                    if (member.isTrainer)
-                      Text(
-                        '${member.activeClientsCount} Active Clients • ⭐ ${member.rating}',
-                        style: GoogleFonts.inter(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
-                          color: AppColors.accentAmber,
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 6,
+                      children: [
+                        _buildMemberChip(member.role.badgeLabel, member.role.color),
+                        _buildMemberChip(
+                          member.isOnDuty ? 'On duty' : 'Off duty',
+                          member.isOnDuty ? AppColors.success : Colors.white54,
                         ),
-                      )
-                    else
-                      Text(
-                        '📞 ${member.phone} • ✉️ ${member.email}',
-                        style: GoogleFonts.inter(
-                          fontSize: 11,
-                          color: AppColors.textMutedDark,
-                        ),
-                      ),
+                        if (teamGender.isNotEmpty)
+                          _buildMemberChip(
+                            teamGender,
+                            teamGender == 'Female'
+                                ? const Color(0xFFF472B6)
+                                : (teamGender == 'Male' ? AppColors.accentCyan : AppColors.accentAmber),
+                          ),
+                        if (teamExperience.isNotEmpty)
+                          _buildMemberChip(teamExperience, AppColors.accentAmber),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -12882,6 +12895,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
                 ),
               ),
             ),
+          const SliverToBoxAdapter(child: SizedBox(height: 40)),
         ],
       ),
     );
@@ -13905,7 +13919,8 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
   Widget _buildFacilityTab(Color primaryColor, GymTenantModel? tenant) {
     final gymName = tenant?.gymName ?? 'GCRM One Fitness Facility';
     final address = tenant?.address ?? '452 5th Avenue, New York, NY';
-    final phone = tenant?.phone ?? '+91 98765 43210';
+    final storedPhone = tenant?.phone?.trim() ?? '';
+    final phone = storedPhone.isEmpty ? Validators.mobileHint : storedPhone;
     final ownerName = tenant?.ownerName ?? 'Marcus Vance';
     final adminEmail = tenant?.effectiveAdminEmail ?? 'admin@gym.com';
 
@@ -14008,74 +14023,79 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Row(
-                      children: [
-                        Container(
-                          width: 38,
-                          height: 38,
-                          decoration: BoxDecoration(
-                            gradient: LinearGradient(
-                              colors: [
-                                (tenant?.isLifetimeFree == true
-                                        ? const Color(0xFF8B5CF6)
-                                        : primaryColor)
-                                    .withValues(alpha: 0.25),
-                                (tenant?.isLifetimeFree == true
-                                        ? const Color(0xFF8B5CF6)
-                                        : primaryColor)
-                                    .withValues(alpha: 0.08),
-                              ],
-                            ),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: (tenant?.isLifetimeFree == true
-                                      ? const Color(0xFF8B5CF6)
-                                      : primaryColor)
-                                  .withValues(alpha: 0.5),
-                            ),
-                          ),
-                          child: Icon(
-                            Icons.workspace_premium_rounded,
-                            color: tenant?.isLifetimeFree == true
-                                ? const Color(0xFFC4B5FD)
-                                : primaryColor,
-                            size: 20,
-                          ),
+                    Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            (tenant?.isLifetimeFree == true
+                                    ? const Color(0xFF8B5CF6)
+                                    : primaryColor)
+                                .withValues(alpha: 0.25),
+                            (tenant?.isLifetimeFree == true
+                                    ? const Color(0xFF8B5CF6)
+                                    : primaryColor)
+                                .withValues(alpha: 0.08),
+                          ],
                         ),
-                        const SizedBox(width: 12),
-                        Text(
-                          'GCRM Platform Plan',
-                          style: GoogleFonts.poppins(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ],
-                    ),
-                    if (tenant?.isLifetimeFree == true)
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 3,
-                        ),
-                        decoration: BoxDecoration(
-                          gradient: const LinearGradient(
-                            colors: [Color(0xFF7C3AED), Color(0xFF6D28D9)],
-                          ),
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Text(
-                          'LIFETIME FREE',
-                          style: GoogleFonts.inter(
-                            fontSize: 9.5,
-                            fontWeight: FontWeight.w800,
-                            color: Colors.white,
-                          ),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: (tenant?.isLifetimeFree == true
+                                  ? const Color(0xFF8B5CF6)
+                                  : primaryColor)
+                              .withValues(alpha: 0.5),
                         ),
                       ),
+                      child: Icon(
+                        Icons.workspace_premium_rounded,
+                        color: tenant?.isLifetimeFree == true
+                            ? const Color(0xFFC4B5FD)
+                            : primaryColor,
+                        size: 20,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'GCRM Platform Plan',
+                            style: GoogleFonts.poppins(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.white,
+                            ),
+                          ),
+                          if (tenant?.isLifetimeFree == true) ...[
+                            const SizedBox(height: 6),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 3,
+                              ),
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(
+                                  colors: [Color(0xFF7C3AED), Color(0xFF6D28D9)],
+                                ),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                'LIFETIME FREE',
+                                style: GoogleFonts.inter(
+                                  fontSize: 9.5,
+                                  fontWeight: FontWeight.w800,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
                   ],
                 ),
                 const Divider(color: Color(0xFF202B3C), height: 24),
@@ -14096,6 +14116,7 @@ class _GymAdminDashboardScreenState extends State<GymAdminDashboardScreen>
               ],
             ),
           ),
+          const SizedBox(height: 40),
         ],
       ),
     );
@@ -14315,6 +14336,347 @@ class _ExpensesDonutPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _ExpensesDonutPainter oldDelegate) => true;
+}
+
+class _WhatsAppStatusTab extends StatefulWidget {
+  const _WhatsAppStatusTab({
+    required this.tenantId,
+    required this.primaryColor,
+  });
+
+  final String tenantId;
+  final Color primaryColor;
+
+  @override
+  State<_WhatsAppStatusTab> createState() => _WhatsAppStatusTabState();
+}
+
+class _WhatsAppStatusTabState extends State<_WhatsAppStatusTab> {
+  static const int _pageSize = 10;
+
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>> _older = [];
+  QueryDocumentSnapshot<Map<String, dynamic>>? _cursor;
+  StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _firstPageSub;
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> _latest = [];
+  bool _loadingFirst = true;
+  bool _loadingMore = false;
+  bool _hasMore = true;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _listenToFirstPage();
+  }
+
+  @override
+  void didUpdateWidget(covariant _WhatsAppStatusTab oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.tenantId != widget.tenantId) {
+      _older.clear();
+      _cursor = null;
+      _latest = [];
+      _hasMore = true;
+      _failed = false;
+      _loadingFirst = true;
+      _listenToFirstPage();
+    }
+  }
+
+  Query<Map<String, dynamic>> _logsQuery() {
+    return FirebaseFirestore.instance
+        .collection('whatsapp_message_logs')
+        .where('tenantId', isEqualTo: widget.tenantId);
+  }
+
+  int _updatedAtMillis(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+    final updatedAt = doc.data()['updatedAt'];
+    return updatedAt is Timestamp ? updatedAt.millisecondsSinceEpoch : 0;
+  }
+
+  void _listenToFirstPage() {
+    _firstPageSub?.cancel();
+    _firstPageSub = _logsQuery().limit(_pageSize).snapshots().listen(
+      (snapshot) {
+        if (!mounted) return;
+        setState(() {
+          _latest = snapshot.docs;
+          _loadingFirst = false;
+          _failed = false;
+          if (_older.isEmpty) {
+            _cursor = snapshot.docs.isEmpty ? null : snapshot.docs.last;
+            _hasMore = snapshot.docs.length >= _pageSize;
+          }
+        });
+      },
+      onError: (_) {
+        if (!mounted) return;
+        setState(() {
+          _failed = true;
+          _loadingFirst = false;
+          _loadingMore = false;
+          _hasMore = false;
+        });
+      },
+    );
+  }
+
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> get _docs {
+    final seen = <String>{};
+    final docs = <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+    for (final doc in [..._latest, ..._older]) {
+      if (seen.add(doc.id)) docs.add(doc);
+    }
+    docs.sort((a, b) => _updatedAtMillis(b).compareTo(_updatedAtMillis(a)));
+    return docs;
+  }
+
+  Future<void> _loadMore() async {
+    final cursor = _cursor;
+    if (_loadingMore || !_hasMore || cursor == null) return;
+    setState(() => _loadingMore = true);
+    try {
+      final snapshot = await _logsQuery().startAfterDocument(cursor).limit(_pageSize).get();
+      if (!mounted) return;
+      setState(() {
+        final seen = {..._latest.map((doc) => doc.id), ..._older.map((doc) => doc.id)};
+        var added = 0;
+        for (final doc in snapshot.docs) {
+          if (seen.add(doc.id)) {
+            _older.add(doc);
+            added++;
+          }
+        }
+        if (snapshot.docs.isNotEmpty) _cursor = snapshot.docs.last;
+        _hasMore = added > 0 && snapshot.docs.length >= _pageSize;
+        _loadingMore = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _loadingMore = false;
+        _hasMore = false;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _firstPageSub?.cancel();
+    super.dispose();
+  }
+
+  Color _statusColor(String status) {
+    switch (status) {
+      case 'read':
+        return AppColors.accentViolet;
+      case 'delivered':
+        return AppColors.accentEmerald;
+      case 'sent':
+        return AppColors.accentCyan;
+      case 'failed':
+        return AppColors.error;
+      default:
+        return AppColors.accentAmber;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_failed && _docs.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            'WhatsApp status could not load.',
+            textAlign: TextAlign.center,
+            style: GoogleFonts.inter(color: AppColors.error),
+          ),
+        ),
+      );
+    }
+    if (_loadingFirst && _docs.isEmpty) {
+      return Center(child: CircularProgressIndicator(strokeWidth: 2, color: widget.primaryColor));
+    }
+    if (_docs.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            'No WhatsApp messages yet.',
+            textAlign: TextAlign.center,
+            style: GoogleFonts.inter(color: AppColors.textSecondaryDark, height: 1.4),
+          ),
+        ),
+      );
+    }
+
+    final docs = _docs;
+    return NotificationListener<ScrollNotification>(
+      onNotification: (notification) {
+        if (notification is! ScrollUpdateNotification || notification.metrics.axis != Axis.vertical) {
+          return false;
+        }
+        final metrics = notification.metrics;
+        final nearBottom = metrics.maxScrollExtent > 0 &&
+            metrics.pixels >= metrics.maxScrollExtent - 160;
+        if (nearBottom) _loadMore();
+        return false;
+      },
+      child: ListView.separated(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
+        itemCount: docs.length + 2,
+        separatorBuilder: (context, index) => index >= docs.length - 1
+            ? const SizedBox.shrink()
+            : const SizedBox(height: 10),
+        itemBuilder: (context, index) {
+          if (index == docs.length + 1) return const SizedBox(height: 40);
+          if (index == docs.length) {
+            if (_loadingMore) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Center(
+                  child: SizedBox(
+                    width: 22,
+                    height: 22,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: widget.primaryColor),
+                  ),
+                ),
+              );
+            }
+            if (!_hasMore) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Center(
+                  child: Text(
+                    'No more data',
+                    style: GoogleFonts.inter(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.white38,
+                    ),
+                  ),
+                ),
+              );
+            }
+            return const SizedBox(height: 8);
+          }
+          return _WhatsAppLogCard(data: docs[index].data(), statusColor: _statusColor);
+        },
+      ),
+    );
+  }
+}
+
+class _WhatsAppLogCard extends StatelessWidget {
+  const _WhatsAppLogCard({
+    required this.data,
+    required this.statusColor,
+  });
+
+  final Map<String, dynamic> data;
+  final Color Function(String status) statusColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = (data['status'] ?? 'accepted').toString();
+    final memberName = (data['memberName'] ?? data['recipientId'] ?? 'Member').toString();
+    final templateName = (data['templateName'] ?? '').toString();
+    final phone = (data['phone'] ?? data['recipientId'] ?? '').toString();
+    final errorMessage = (data['errorMessage'] ?? '').toString();
+    final errorDetails = (data['errorDetails'] ?? '').toString();
+    final errorCode = data['errorCode'];
+    final updatedAt = data['updatedAt'];
+    final when = updatedAt is Timestamp ? DateFormat('d MMM, h:mm a').format(updatedAt.toDate()) : '';
+    final color = statusColor(status);
+    final errorText = [
+      if (errorCode != null) 'Error $errorCode',
+      if (errorMessage.isNotEmpty) errorMessage,
+      if (errorDetails.isNotEmpty) errorDetails,
+    ].join(' · ');
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.darkCard,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: AppColors.darkCardBorder),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  memberName,
+                  style: GoogleFonts.poppins(
+                    color: Colors.white,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: color.withValues(alpha: 0.16),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  status,
+                  style: GoogleFonts.inter(
+                    color: color,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            [if (templateName.isNotEmpty) templateName, if (phone.isNotEmpty) phone, if (when.isNotEmpty) when]
+                .join(' · '),
+            style: GoogleFonts.inter(color: AppColors.textSecondaryDark, fontSize: 12),
+          ),
+          if (errorText.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Text(
+                    errorText,
+                    style: GoogleFonts.inter(color: AppColors.error, fontSize: 12, height: 1.35),
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Copy error',
+                  padding: EdgeInsets.zero,
+                  visualDensity: VisualDensity.compact,
+                  constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                  icon: const Icon(Icons.copy_rounded, size: 16, color: AppColors.error),
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: errorText));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          'Error copied',
+                          style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                        ),
+                        behavior: SnackBarBehavior.floating,
+                      ),
+                    );
+                  },
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
 }
 
 class _StagedGalleryItem {

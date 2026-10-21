@@ -3,11 +3,15 @@ import 'dart:io';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/foundation.dart';
+import '../config/white_label_config.dart';
 import 'notification_display.dart';
 
 /// In-App Notification Alert Model
 class PushNotificationAlert {
+  static const membersTab = 'members';
+
   final String id;
   final String title;
   final String body;
@@ -15,6 +19,7 @@ class PushNotificationAlert {
   final String? sound;
   final String? targetAudience;
   final String? targetTenantId;
+  final String? openTab;
 
   const PushNotificationAlert({
     required this.id,
@@ -24,6 +29,34 @@ class PushNotificationAlert {
     this.sound,
     this.targetAudience,
     this.targetTenantId,
+    this.openTab,
+  });
+
+  bool get opensMembersTab => openTab == membersTab;
+
+  /// Membership reminder pushes are shown when they arrive and are not kept in the inbox.
+  bool get isMembershipReminder =>
+      opensMembersTab || title.trim() == 'Membership reminders';
+
+  /// Digest pushes open the Members tab. Other broadcasts leave the current tab.
+  static String? openTabFrom(Map<dynamic, dynamic> data) {
+    final tab = data['openTab']?.toString().trim();
+    if (tab == membersTab) return membersTab;
+    if (data['type']?.toString() == 'membership_digest') return membersTab;
+    return null;
+  }
+}
+
+/// One page of a gym admin's notification inbox.
+class NotificationInboxPage {
+  static const pageSize = 10;
+
+  final List<PushNotificationAlert> alerts;
+  final bool hasMore;
+
+  const NotificationInboxPage({
+    required this.alerts,
+    required this.hasMore,
   });
 }
 
@@ -46,9 +79,41 @@ class NotificationService {
   /// Stream of incoming push notification alerts that UI can listen to
   static Stream<PushNotificationAlert> get onNotificationAlert => _alertController.stream;
 
+  /// Tab the next gym-admin screen should open, kept until that screen is showing.
+  static String? _pendingOpenTab;
+  static final StreamController<String> _openTabController =
+      StreamController<String>.broadcast();
+
+  /// Fires when a notification tap asks the gym admin dashboard to switch tabs.
+  static Stream<String> get onOpenTab => _openTabController.stream;
+
+  static bool get hasPendingMembersTab =>
+      _pendingOpenTab == PushNotificationAlert.membersTab;
+
+  /// Records a Members-tab open and notifies a dashboard that is already open.
+  static void requestMembersTab() {
+    _pendingOpenTab = PushNotificationAlert.membersTab;
+    if (!_openTabController.isClosed) {
+      _openTabController.add(PushNotificationAlert.membersTab);
+    }
+  }
+
+  /// Clears a pending Members-tab open. Returns true when one was waiting.
+  static bool consumeMembersTabRequest() {
+    if (!hasPendingMembersTab) return false;
+    _pendingOpenTab = null;
+    return true;
+  }
+
+  static void _openFromRemoteMessage(RemoteMessage message) {
+    if (PushNotificationAlert.openTabFrom(message.data) ==
+        PushNotificationAlert.membersTab) {
+      requestMembersTab();
+    }
+  }
+
   /// Active Firestore realtime listener subscriptions
-  static StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _realtimeQueueSub;
-  static StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _userInboxSub;
+  static StreamSubscription<dynamic>? _userInboxSub;
 
   /// Cache of processed notification IDs to avoid duplicate alerts
   static final Set<String> _processedAlertIds = <String>{};
@@ -59,6 +124,10 @@ class NotificationService {
     String? targetTenantId,
     String? gymTenantId,
   }) {
+    if (WhiteLabelConfig.isRestricted &&
+        (targetAudience == 'all' || targetAudience == 'gym_owners')) {
+      return false;
+    }
     if (targetAudience == 'all' || targetAudience == 'gym_owners') return true;
     if (targetAudience == 'specific_gym') {
       final target = targetTenantId?.trim() ?? '';
@@ -85,6 +154,7 @@ class NotificationService {
       sound: data['sound']?.toString() ?? 'notification.mp3',
       targetAudience: data['targetAudience']?.toString(),
       targetTenantId: data['targetTenantId']?.toString(),
+      openTab: PushNotificationAlert.openTabFrom(data),
     );
   }
 
@@ -106,6 +176,11 @@ class NotificationService {
         badge: true,
         sound: false,
       );
+      NotificationDisplay.onTap = (payload) {
+        if (payload == PushNotificationAlert.membersTab) {
+          requestMembersTab();
+        }
+      };
       await NotificationDisplay.initialize();
 
       // 2. Request permission explicitly so the user sees the system prompt
@@ -123,12 +198,14 @@ class NotificationService {
       // 4. Notification tap when app was in background
       FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
         debugPrint('FCM message opened from background: ${message.notification?.title}');
+        _openFromRemoteMessage(message);
       });
 
       // 5. Check if app was opened directly from a terminated state via notification
       final initialMessage = await _messaging.getInitialMessage();
       if (initialMessage != null) {
         debugPrint('FCM app launched from terminated state via notification: ${initialMessage.notification?.title}');
+        _openFromRemoteMessage(initialMessage);
       }
 
       _isInitialized = true;
@@ -224,14 +301,19 @@ class NotificationService {
         );
       }
 
-      // Subscribe device to broadcast topics for resilient audience dispatch
+      // White-label builds only listen on their own gym topic.
+      // The platform app also listens to the shared all / gym_owners topics.
       try {
-        await _messaging.subscribeToTopic('all');
-        await _messaging.subscribeToTopic('gym_owners');
-        if (tenantId != null && tenantId.trim().isNotEmpty) {
+        if (!WhiteLabelConfig.isRestricted) {
+          await _messaging.subscribeToTopic('all');
+          await _messaging.subscribeToTopic('gym_owners');
+        }
+        if (tenantId != null &&
+            tenantId.trim().isNotEmpty &&
+            WhiteLabelConfig.allows(tenantId)) {
           await _messaging.subscribeToTopic('gym_$tenantId');
         }
-        debugPrint('FCM subscribed device to topics (all, gym_owners, gym_$tenantId)');
+        debugPrint('FCM subscribed device to gym topic gym_$tenantId');
       } catch (topicError) {
         debugPrint('Notice: FCM topic subscription: $topicError');
       }
@@ -281,84 +363,197 @@ class NotificationService {
     }
   }
 
-  /// Loads broadcasts already delivered to this gym admin, newest first.
-  static Future<List<PushNotificationAlert>> loadInbox({
+  /// Loads one page of this gym admin's inbox, newest first.
+  /// The backend returns at most 10 documents per call.
+  static String? _inboxCursor;
+  static bool _inboxHasMore = false;
+  static bool _inboxLegacyMigrated = false;
+  static String? _inboxUserId;
+  static List<PushNotificationAlert>? _legacyAlerts;
+  static int _legacyOffset = 0;
+
+  static bool get inboxHasMore => _inboxHasMore;
+
+  static Future<NotificationInboxPage> loadInbox({
     required String userId,
     String? tenantId,
-    int limit = 40,
+    bool reset = true,
   }) async {
-    if (!isFirebaseReady || userId.trim().isEmpty) return [];
-
-    final byId = <String, PushNotificationAlert>{};
+    if (!isFirebaseReady || userId.trim().isEmpty) {
+      return const NotificationInboxPage(alerts: [], hasMore: false);
+    }
+    if (_inboxUserId != userId) {
+      reset = true;
+      _inboxLegacyMigrated = false;
+      _inboxCursor = null;
+    }
+    _inboxUserId = userId;
+    if (reset) _inboxCursor = null;
 
     try {
-      final userSnap = await _firestore.collection('users').doc(userId).get();
-      for (final alert in _alertsFromInboxField(userSnap.data())) {
-        byId[alert.id] = alert;
-      }
+      final page = await _loadInboxPage(
+        userId: userId,
+        tenantId: tenantId,
+        reset: reset,
+      );
+      _inboxHasMore = page.hasMore;
+      return page;
     } catch (e) {
       debugPrint('Notice: Unable to read gym admin notification inbox: $e');
+      _inboxHasMore = false;
+      return const NotificationInboxPage(alerts: [], hasMore: false);
+    }
+  }
+
+  static Future<NotificationInboxPage> _loadInboxPage({
+    required String userId,
+    required String? tenantId,
+    required bool reset,
+  }) async {
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable('listNotificationInbox');
+      final response = await callable.call({
+        'startAfter': reset ? null : _inboxCursor,
+        'migrate': reset && !_inboxLegacyMigrated,
+      });
+      final data = Map<String, dynamic>.from(response.data as Map);
+      if (reset) _inboxLegacyMigrated = true;
+      return _pageFromBackend(data, tenantId);
+    } on FirebaseFunctionsException catch (e) {
+      if (e.code == 'not-found') {
+        debugPrint('Notice: listNotificationInbox is not deployed. Showing saved notifications.');
+        return _loadLegacyInboxPage(userId: userId, tenantId: tenantId, reset: reset);
+      }
+      debugPrint('Notice: Notification inbox callable failed (${e.code}).');
+    } catch (e) {
+      debugPrint('Notice: Notification inbox callable failed: $e');
     }
 
     try {
-      QuerySnapshot<Map<String, dynamic>> snap;
-      try {
-        snap = await _firestore
-            .collection('notifications_queue')
-            .orderBy('createdAt', descending: true)
-            .limit(limit)
-            .get();
-      } catch (orderedError) {
-        debugPrint('Notice: Ordered notification history failed, reading recent docs: $orderedError');
-        snap = await _firestore.collection('notifications_queue').limit(limit).get();
-      }
-      for (final doc in snap.docs) {
-        final alert = _alertFromQueueDoc(doc.id, doc.data(), tenantId);
-        if (alert != null) byId.putIfAbsent(alert.id, () => alert);
-      }
-    } catch (e) {
-      debugPrint('Notice: Unable to read notifications_queue history: $e');
+      return await _loadInboxPageFromFirestore(userId: userId, tenantId: tenantId, reset: reset);
+    } on FirebaseException catch (e) {
+      if (e.code != 'permission-denied') rethrow;
+      debugPrint('Notice: Notification documents are not readable yet. Showing saved notifications.');
+      return _loadLegacyInboxPage(userId: userId, tenantId: tenantId, reset: reset);
     }
+  }
 
-    final alerts = byId.values.toList()
-      ..sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
-    if (alerts.length > limit) {
-      return alerts.sublist(0, limit);
+  static NotificationInboxPage _pageFromBackend(
+    Map<String, dynamic> data,
+    String? tenantId,
+  ) {
+    final rawItems = data['items'];
+    final alerts = <PushNotificationAlert>[];
+    if (rawItems is List) {
+      for (final item in rawItems) {
+        if (item is! Map) continue;
+        final map = Map<String, dynamic>.from(item);
+        final alert = _alertFromQueueDoc(map['id']?.toString() ?? '', map, tenantId);
+        if (alert != null) alerts.add(alert);
+      }
+    }
+    final cursor = data['nextCursor']?.toString().trim() ?? '';
+    if (cursor.isNotEmpty) _inboxCursor = cursor;
+    return NotificationInboxPage(
+      alerts: alerts,
+      hasMore: data['hasMore'] == true,
+    );
+  }
+
+  static Future<NotificationInboxPage> _loadInboxPageFromFirestore({
+    required String userId,
+    required String? tenantId,
+    required bool reset,
+  }) async {
+    Query<Map<String, dynamic>> query = _firestore
+        .collection('users')
+        .doc(userId)
+        .collection('notifications')
+        .orderBy('createdAt', descending: true)
+        .limit(NotificationInboxPage.pageSize);
+    final cursor = _inboxCursor;
+    if (!reset && cursor != null && cursor.isNotEmpty) {
+      query = query.startAfter([cursor]);
+    }
+    final snap = await query.get();
+    if (snap.docs.isNotEmpty) {
+      final createdAt = snap.docs.last.data()['createdAt']?.toString().trim() ?? '';
+      if (createdAt.isNotEmpty) _inboxCursor = createdAt;
+    }
+    final alerts = <PushNotificationAlert>[];
+    for (final doc in snap.docs) {
+      final alert = _alertFromQueueDoc(doc.id, doc.data(), tenantId);
+      if (alert != null) alerts.add(alert);
+    }
+    return NotificationInboxPage(
+      alerts: alerts,
+      hasMore: snap.docs.length >= NotificationInboxPage.pageSize,
+    );
+  }
+
+  /// Pages the notifications already stored on the user document.
+  /// One read covers every page until the inbox is opened again.
+  static Future<NotificationInboxPage> _loadLegacyInboxPage({
+    required String userId,
+    required String? tenantId,
+    required bool reset,
+  }) async {
+    if (reset || _legacyAlerts == null || _inboxUserId != userId) {
+      final snap = await _firestore.collection('users').doc(userId).get();
+      final alerts = _alertsFromInboxField(snap.data(), tenantId);
+      alerts.sort((a, b) => b.receivedAt.compareTo(a.receivedAt));
+      _legacyAlerts = alerts;
+      _legacyOffset = 0;
+    }
+    final all = _legacyAlerts ?? const <PushNotificationAlert>[];
+    final start = reset ? 0 : _legacyOffset;
+    if (start >= all.length) {
+      return const NotificationInboxPage(alerts: [], hasMore: false);
+    }
+    final end = start + NotificationInboxPage.pageSize;
+    final sliceEnd = end > all.length ? all.length : end;
+    _legacyOffset = sliceEnd;
+    return NotificationInboxPage(
+      alerts: all.sublist(start, sliceEnd),
+      hasMore: sliceEnd < all.length,
+    );
+  }
+
+  static List<PushNotificationAlert> _alertsFromInboxField(
+    Map<String, dynamic>? data,
+    String? tenantId,
+  ) {
+    final raw = data?['platformNotifications'];
+    if (raw is! List) return [];
+    final alerts = <PushNotificationAlert>[];
+    for (final item in raw) {
+      if (item is! Map) continue;
+      final map = Map<String, dynamic>.from(item);
+      final alert = _alertFromQueueDoc(map['id']?.toString() ?? '', map, tenantId);
+      if (alert != null) alerts.add(alert);
     }
     return alerts;
   }
 
-  /// Starts listeners that surface new broadcasts while the gym admin app is open.
+  /// Starts a listener for the newest inbox document only.
   /// The first snapshot is history and is not announced again.
   static void startRealtimeListener({
     required String? tenantId,
     required String? userId,
   }) {
     if (!isFirebaseReady) return;
-    _realtimeQueueSub?.cancel();
     _userInboxSub?.cancel();
 
-    if (userId != null && userId.trim().isNotEmpty) {
-      var inboxSeeded = false;
-      _userInboxSub = _firestore.collection('users').doc(userId).snapshots().listen((snap) {
-        final alerts = _alertsFromInboxField(snap.data());
-        if (!inboxSeeded) {
-          inboxSeeded = true;
-          _processedAlertIds.addAll(alerts.map((alert) => alert.id));
-          return;
-        }
-        _publishNewAlerts(alerts);
-      }, onError: (e) {
-        debugPrint('Notice: Error in gym admin inbox listener: $e');
-      });
-    }
+    if (userId == null || userId.trim().isEmpty) return;
 
     try {
-      var queueSeeded = false;
-      _realtimeQueueSub = _firestore
-          .collection('notifications_queue')
+      var inboxSeeded = false;
+      _userInboxSub = _firestore
+          .collection('users')
+          .doc(userId)
+          .collection('notifications')
           .orderBy('createdAt', descending: true)
-          .limit(30)
+          .limit(1)
           .snapshots()
           .listen((snapshot) {
         final alerts = <PushNotificationAlert>[];
@@ -366,24 +561,48 @@ class NotificationService {
           final alert = _alertFromQueueDoc(doc.id, doc.data(), tenantId);
           if (alert != null) alerts.add(alert);
         }
-        if (!queueSeeded) {
-          queueSeeded = true;
+        if (!inboxSeeded) {
+          inboxSeeded = true;
           _processedAlertIds.addAll(alerts.map((alert) => alert.id));
           return;
         }
         _publishNewAlerts(alerts);
       }, onError: (e) {
-        debugPrint('Notice: Error in notifications_queue real-time listener: $e');
+        if (_isPermissionDenied(e)) {
+          _userInboxSub?.cancel();
+          _listenLegacyUserInbox(userId, tenantId);
+          return;
+        }
+        debugPrint('Notice: Error in gym admin inbox listener: $e');
       });
     } catch (e) {
       debugPrint('Notice: Failed to start realtime notification listener: $e');
     }
   }
 
+  /// Used until the notification subcollection rules are deployed.
+  static void _listenLegacyUserInbox(String userId, String? tenantId) {
+    var seeded = false;
+    _userInboxSub = _firestore.collection('users').doc(userId).snapshots().listen((snap) {
+      final alerts = _alertsFromInboxField(snap.data(), tenantId);
+      if (!seeded) {
+        seeded = true;
+        _processedAlertIds.addAll(alerts.map((alert) => alert.id));
+        return;
+      }
+      _publishNewAlerts(alerts);
+    }, onError: (e) {
+      debugPrint('Notice: Error in gym admin inbox listener: $e');
+    });
+  }
+
+  static bool _isPermissionDenied(Object error) {
+    if (error is FirebaseException) return error.code == 'permission-denied';
+    return error.toString().contains('permission-denied');
+  }
+
   /// Cancels the real-time notification listeners
   static void stopRealtimeListener() {
-    _realtimeQueueSub?.cancel();
-    _realtimeQueueSub = null;
     _userInboxSub?.cancel();
     _userInboxSub = null;
   }
@@ -401,30 +620,17 @@ class NotificationService {
       id: alert.id,
       title: alert.title,
       body: alert.body,
+      payload: alert.openTab,
     );
   }
 
-  static List<PushNotificationAlert> _alertsFromInboxField(Map<String, dynamic>? data) {
-    final raw = data?['platformNotifications'];
-    if (raw is! List) return [];
-    final alerts = <PushNotificationAlert>[];
-    for (final item in raw) {
-      if (item is! Map) continue;
-      final map = Map<String, dynamic>.from(item);
-      final id = map['id']?.toString() ?? '';
-      final title = map['title']?.toString() ?? '';
-      if (id.isEmpty || title.isEmpty) continue;
-      alerts.add(PushNotificationAlert(
-        id: id,
-        title: title,
-        body: map['body']?.toString() ?? '',
-        receivedAt: _parseAlertTime(map['createdAt']),
-        sound: map['sound']?.toString() ?? 'notification.mp3',
-        targetAudience: map['targetAudience']?.toString(),
-        targetTenantId: map['targetTenantId']?.toString(),
-      ));
-    }
-    return alerts;
+  static bool _isMembershipReminder(String docId, Map<dynamic, dynamic> data) {
+    final type = data['type']?.toString();
+    if (type == 'membership_digest' || type == 'membership_expiry') return true;
+    if (data['openTab']?.toString().trim() == PushNotificationAlert.membersTab) return true;
+    if (data['title']?.toString().trim() == 'Membership reminders') return true;
+    final id = '${data['id'] ?? ''} $docId';
+    return id.contains('__digest__daily__');
   }
 
   static PushNotificationAlert? _alertFromQueueDoc(
@@ -432,7 +638,12 @@ class NotificationService {
     Map<String, dynamic> data,
     String? tenantId,
   ) {
-    final targetAudience = data['targetAudience']?.toString() ?? 'all';
+    if (_isMembershipReminder(docId, data)) return null;
+    var targetAudience = data['targetAudience']?.toString().trim() ?? '';
+    if (targetAudience.isEmpty) {
+      final tenant = data['targetTenantId']?.toString().trim() ?? '';
+      targetAudience = tenant.isNotEmpty ? 'specific_gym' : 'all';
+    }
     final targetTenantId = data['targetTenantId']?.toString();
     if (!broadcastMatchesGym(
       targetAudience: targetAudience,
@@ -451,6 +662,7 @@ class NotificationService {
       sound: data['sound']?.toString() ?? 'notification.mp3',
       targetAudience: targetAudience,
       targetTenantId: targetTenantId,
+      openTab: PushNotificationAlert.openTabFrom(data),
     );
   }
 
@@ -466,6 +678,12 @@ class NotificationService {
     if (!isFirebaseReady) return;
     try {
       stopRealtimeListener();
+      _inboxCursor = null;
+      _inboxHasMore = false;
+      _inboxLegacyMigrated = false;
+      _inboxUserId = null;
+      _legacyAlerts = null;
+      _legacyOffset = 0;
       await _firestore.collection('users').doc(userId).set({
         'fcmToken': null,
       }, SetOptions(merge: true));

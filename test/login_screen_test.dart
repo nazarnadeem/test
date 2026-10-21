@@ -99,9 +99,11 @@ void main() {
       expect(find.byType(GymAdminDashboardScreen), findsOneWidget);
       expect(find.byType(SuperAdminDashboardScreen), findsNothing);
 
-      // Verify Gym Admin Header & Badges
-      expect(find.text('GYM ADMIN'), findsOneWidget);
-      expect(find.text('Manager: Marcus Vance'), findsOneWidget);
+      // Verify the header shows the gym name and gym code only
+      expect(find.text('MetroFitness Central Club'), findsOneWidget);
+      expect(find.text('METRO-NY'), findsOneWidget);
+      expect(find.text('GYM ADMIN'), findsNothing);
+      expect(find.text('Manager: Marcus Vance'), findsNothing);
 
       // Verify Gym Admin Operational Tabs
       expect(find.text('Overview'), findsOneWidget);

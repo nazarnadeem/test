@@ -427,8 +427,8 @@ void main() {
 
       // Verify Member Card displays Lifetime Free badge and VIP Lifetime Pass
       expect(find.text('Bruce Wayne'), findsOneWidget);
-      expect(find.text('♾️ Lifetime Free'), findsOneWidget);
-      expect(find.text('Plan: VIP Lifetime Free'), findsOneWidget);
+      expect(find.text('Lifetime'), findsOneWidget);
+      expect(find.text('VIP Lifetime Free'), findsOneWidget);
     });
 
     testWidgets('Edit member modal opens pre-filled and updates member profile successfully',

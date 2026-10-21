@@ -461,11 +461,11 @@ void main() {
       expect(updatedMember.batchId, isNull);
       expect(updatedMember.batchName, isNull);
 
-      // Check Members tab to ensure it shows 'Batch: Unassigned'
+      // Check Members tab to ensure the batch shows as unassigned
       await tester.tap(find.text('Members'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Batch: Unassigned'), findsOneWidget);
+      expect(find.text('Unassigned'), findsOneWidget);
     });
   });
 }

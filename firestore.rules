@@ -39,6 +39,13 @@ service cloud.firestore {
       allow read: if true;
       allow create, update: if isUser(userId) || isSuperAdmin() || isAuthenticated();
       allow delete: if isSuperAdmin();
+
+      // One document per notification so the app can read 10 at a time.
+      match /notifications/{notificationId} {
+        allow read: if true;
+        allow create, update: if isAuthenticated();
+        allow delete: if isUser(userId) || isSuperAdmin();
+      }
     }
 
     // ──────── 2. GYM TENANTS / FRANCHISES (BY GYM ID) ────────
@@ -186,6 +193,22 @@ service cloud.firestore {
     // ──────── 6. PUSH NOTIFICATIONS QUEUE & BROADCASTS ────────
     match /notifications_queue/{notificationId} {
       allow read, write: if isAuthenticated();
+    }
+
+    // Written by Cloud Functions. Gym admins read delivery status and errors.
+    match /whatsapp_message_logs/{logId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // Per-gym WhatsApp tokens. Only Cloud Functions can read or write this collection.
+    match /whatsapp_secrets/{tenantId} {
+      allow read, write: if false;
+    }
+
+    // Daily membership reminder claims. Only Cloud Functions can read or write these.
+    match /membership_reminder_logs/{logId} {
+      allow read, write: if false;
     }
   }
 }

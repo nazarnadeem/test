@@ -4,6 +4,8 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../../core/constants/app_colors.dart';
+import '../../../../core/constants/app_strings.dart';
+import '../../../../core/services/whatsapp_service.dart';
 import '../../../../core/utils/image_optimizer.dart';
 import '../../../../core/utils/validators.dart';
 import '../../../../core/widgets/custom_button.dart';
@@ -13,6 +15,7 @@ import '../../controllers/auth_controller.dart';
 import '../../data/models/gym_tenant_model.dart';
 import '../../data/models/platform_plan_model.dart';
 import '../../data/models/push_notification_model.dart';
+import '../widgets/gym_whatsapp_settings_card.dart';
 import 'login_screen.dart';
 
 /// Flagship Super Admin Dashboard Screen for GCRM One Platform Lead.
@@ -484,7 +487,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                       ),
                                       const SizedBox(width: 8),
                                       Text(
-                                        'GCRM ONE',
+                                        AppStrings.appName,
                                         style: GoogleFonts.poppins(
                                           fontSize: 11,
                                           fontWeight: FontWeight.w700,
@@ -684,6 +687,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     final adminNameCtrl = TextEditingController();
     final adminEmailCtrl = TextEditingController();
     final adminPasswordCtrl = TextEditingController();
+    final whatsAppControllers = GymWhatsAppSettingsControllers();
     final hexColorCtrl = TextEditingController(text: '#FF5722');
     final formKey = GlobalKey<FormState>();
 
@@ -1747,9 +1751,10 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                             CustomTextField(
                               controller: phoneCtrl,
                               label: 'Contact Phone Number',
-                              hint: '+91 98765 43210',
+                              hint: Validators.mobileHint,
                               prefixIcon: Icons.phone_rounded,
-                              keyboardType: TextInputType.phone,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: Validators.mobileInputFormatters,
                               validator: Validators.phone,
                             ),
                             const SizedBox(height: 12),
@@ -1850,6 +1855,17 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                               validator: Validators.password,
                             ),
                             const SizedBox(height: 24),
+                            Text(
+                              'WhatsApp',
+                              style: GoogleFonts.poppins(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            GymWhatsAppSettingsFields(controllers: whatsAppControllers),
+                            const SizedBox(height: 24),
 
                             // Submit Button
                             CustomButton(
@@ -1865,6 +1881,22 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                       if (!formKey.currentState!.validate()) return;
 
                                       setModalState(() => isSubmitting = true);
+
+                                      if (whatsAppControllers.hasPhoneNumber &&
+                                          whatsAppControllers.accessToken.text.trim().isEmpty) {
+                                        setModalState(() => isSubmitting = false);
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text(
+                                              'Add the WhatsApp access token for this phone number, or leave the phone number blank.',
+                                              style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                                            ),
+                                            backgroundColor: AppColors.error,
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                        return;
+                                      }
 
                                       final success =
                                           await widget.authController.registerGymWithAdmin(
@@ -1888,6 +1920,31 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                         isLifetimeFree: isLifetimeFree,
                                       );
 
+                                      var message = success
+                                          ? 'Gym "${nameCtrl.text.trim()}" & Admin account (${adminEmailCtrl.text.trim()}) registered successfully!'
+                                          : (widget.authController.errorMessage ?? 'Failed to register gym.');
+                                      if (success && whatsAppControllers.hasPhoneNumber) {
+                                        final adminEmail = adminEmailCtrl.text.trim().toLowerCase();
+                                        final tenant = widget.authController.gymTenants
+                                            .where((gym) => (gym.adminEmail ?? '').toLowerCase() == adminEmail)
+                                            .firstOrNull;
+                                        if (tenant == null) {
+                                          message = '$message WhatsApp settings were not saved.';
+                                        } else {
+                                          try {
+                                            await WhatsAppService.saveSettings(
+                                              tenantId: tenant.id,
+                                              phoneNumberId: whatsAppControllers.phoneNumberId.text,
+                                              accessToken: whatsAppControllers.accessToken.text,
+                                              templates: whatsAppControllers.templates.text,
+                                            );
+                                          } catch (error) {
+                                            message =
+                                                '$message WhatsApp settings were not saved: ${error.toString().replaceFirst('Exception: ', '')}';
+                                          }
+                                        }
+                                      }
+
                                       if (ctx.mounted) {
                                         Navigator.pop(ctx);
                                       }
@@ -1896,10 +1953,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                         ScaffoldMessenger.of(context).showSnackBar(
                                           SnackBar(
                                             content: Text(
-                                              success
-                                                  ? 'Gym "${nameCtrl.text.trim()}" & Admin account (${adminEmailCtrl.text.trim()}) registered successfully!'
-                                                  : (widget.authController.errorMessage ??
-                                                      'Failed to register gym.'),
+                                              message,
                                               style: GoogleFonts.inter(
                                                 fontWeight: FontWeight.w600,
                                               ),
@@ -1927,11 +1981,22 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
     );
   }
 
-  void _showEditGymDialog(GymTenantModel tenant) {
+  void _showEditGymDialog(GymTenantModel tenant) async {
+    final whatsAppControllers = GymWhatsAppSettingsControllers();
+    var whatsAppTokenSaved = false;
+    var whatsAppReady = false;
+    try {
+      final settings = await WhatsAppService.loadSettings(tenantId: tenant.id);
+      whatsAppControllers.apply(settings);
+      whatsAppTokenSaved = settings.tokenSaved;
+      whatsAppReady = true;
+    } catch (_) {}
+    if (!mounted) return;
+
     final nameCtrl = TextEditingController(text: tenant.gymName);
     final ownerCtrl = TextEditingController(text: tenant.ownerName);
     final ownerEmailCtrl = TextEditingController(text: tenant.ownerEmail);
-    final phoneCtrl = TextEditingController(text: tenant.phone ?? '');
+    final phoneCtrl = TextEditingController(text: Validators.tenDigits(tenant.phone));
     final addressCtrl = TextEditingController(text: tenant.address);
     final hexColorCtrl = TextEditingController(text: tenant.primaryColorHex);
     final formKey = GlobalKey<FormState>();
@@ -2916,9 +2981,10 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                             CustomTextField(
                               controller: phoneCtrl,
                               label: 'Contact Phone Number',
-                              hint: '+91 98765 43210',
+                              hint: Validators.mobileHint,
                               prefixIcon: Icons.phone_rounded,
-                              keyboardType: TextInputType.phone,
+                              keyboardType: TextInputType.number,
+                              inputFormatters: Validators.mobileInputFormatters,
                               validator: Validators.phone,
                             ),
                             const SizedBox(height: 12),
@@ -2932,6 +2998,30 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                               validator: (v) => Validators.requiredField(v, 'Location'),
                             ),
                             const SizedBox(height: 24),
+                            Text(
+                              'WhatsApp',
+                              style: GoogleFonts.poppins(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            if (whatsAppReady)
+                              GymWhatsAppSettingsFields(
+                                controllers: whatsAppControllers,
+                                tokenSaved: whatsAppTokenSaved,
+                              )
+                            else
+                              Text(
+                                'WhatsApp settings could not be loaded. Gym details can still be saved.',
+                                style: GoogleFonts.inter(
+                                  color: AppColors.textSecondaryDark,
+                                  fontSize: 12,
+                                  height: 1.4,
+                                ),
+                              ),
+                            const SizedBox(height: 24),
 
                             // Save Changes Button
                             CustomButton(
@@ -2943,6 +3033,23 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                   ? null
                                   : () async {
                                       if (!formKey.currentState!.validate()) return;
+
+                                      if (whatsAppReady &&
+                                          whatsAppControllers.hasPhoneNumber &&
+                                          whatsAppControllers.accessToken.text.trim().isEmpty &&
+                                          !whatsAppTokenSaved) {
+                                        ScaffoldMessenger.of(context).showSnackBar(
+                                          SnackBar(
+                                            content: Text(
+                                              'Add the WhatsApp access token for this phone number, or leave the phone number blank.',
+                                              style: GoogleFonts.inter(fontWeight: FontWeight.w600),
+                                            ),
+                                            backgroundColor: AppColors.error,
+                                            behavior: SnackBarBehavior.floating,
+                                          ),
+                                        );
+                                        return;
+                                      }
 
                                       setModalState(() => isSubmitting = true);
 
@@ -2977,6 +3084,22 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                       );
 
                                       final success = await widget.authController.updateGymTenant(updatedTenant);
+                                      var message = success
+                                          ? 'Gym "${nameCtrl.text.trim()}" updated successfully!'
+                                          : (widget.authController.errorMessage ?? 'Failed to update gym.');
+                                      if (success && whatsAppReady) {
+                                        try {
+                                          await WhatsAppService.saveSettings(
+                                            tenantId: tenant.id,
+                                            phoneNumberId: whatsAppControllers.phoneNumberId.text,
+                                            accessToken: whatsAppControllers.accessToken.text,
+                                            templates: whatsAppControllers.templates.text,
+                                          );
+                                        } catch (error) {
+                                          message =
+                                              '$message WhatsApp settings were not saved: ${error.toString().replaceFirst('Exception: ', '')}';
+                                        }
+                                      }
 
                                       if (ctx.mounted) {
                                         Navigator.pop(ctx);
@@ -2986,10 +3109,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                                         ScaffoldMessenger.of(context).showSnackBar(
                                           SnackBar(
                                             content: Text(
-                                              success
-                                                  ? 'Gym "${nameCtrl.text.trim()}" updated successfully!'
-                                                  : (widget.authController.errorMessage ??
-                                                      'Failed to update gym.'),
+                                              message,
                                               style: GoogleFonts.inter(fontWeight: FontWeight.w600),
                                             ),
                                             backgroundColor: success ? AppColors.success : AppColors.error,
@@ -3322,7 +3442,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'GCRM ONE',
+              AppStrings.appName,
               style: GoogleFonts.poppins(
                 fontSize: 17,
                 fontWeight: FontWeight.w800,
@@ -3440,7 +3560,19 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
               },
               color: AppColors.primary,
               backgroundColor: const Color(0xFF1B2230),
-              child: SingleChildScrollView(
+              child: NotificationListener<ScrollNotification>(
+                onNotification: (notification) {
+                  if (_selectedTabIndex != 2) return false;
+                  if (!widget.authController.hasMoreSentNotifications) return false;
+                  if (notification.metrics.axis != Axis.vertical) return false;
+                  final nearBottom = notification.metrics.pixels >=
+                      notification.metrics.maxScrollExtent - 200;
+                  if (nearBottom) {
+                    widget.authController.loadNotificationsHistory(reset: false);
+                  }
+                  return false;
+                },
+                child: SingleChildScrollView(
                 physics: const AlwaysScrollableScrollPhysics(),
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
                 child: Column(
@@ -3521,6 +3653,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
                     const SizedBox(height: 80), // FAB space
                   ],
                 ),
+              ),
               ),
             );
           },
@@ -3761,7 +3894,7 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
           ],
         ),
         const SizedBox(height: 14),
-        if (isLoading)
+        if (isLoading && history.isEmpty)
           const Center(
             child: Padding(
               padding: EdgeInsets.all(24.0),
@@ -3805,8 +3938,34 @@ class _SuperAdminDashboardScreenState extends State<SuperAdminDashboardScreen> {
               ),
             ),
           )
-        else
+        else ...[
           ...history.map((record) => _buildNotificationRecordCard(record)),
+          if (isLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 16),
+              child: Center(
+                child: SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.primary),
+                ),
+              ),
+            )
+          else if (!widget.authController.hasMoreSentNotifications)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              child: Center(
+                child: Text(
+                  'No more data',
+                  style: GoogleFonts.inter(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.white38,
+                  ),
+                ),
+              ),
+            ),
+        ],
       ],
     );
   }
