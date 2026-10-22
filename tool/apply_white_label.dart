@@ -31,13 +31,23 @@ void main() {
     exitCode = 1;
     return;
   }
-  if (_originIsMainRepo(root)) {
+  final origin = _remoteUrl(root, 'origin');
+  if (origin == null || _isMainRepoUrl(origin)) {
     stderr.writeln(
-      'Refusing to apply. origin is the main GCRM repo. Clone the project, point origin at the customer repo, edit white_label/active.json there, then run this command. Running it here and pushing writes the customer name onto the main app and every clone that pulls main.',
+      'Refusing to apply. origin must be the customer repo, not the main GCRM repo. In the customer folder: git remote rename origin upstream, then git remote add origin <customer-repo-url>.',
     );
     exitCode = 1;
     return;
   }
+  final upstream = _remoteUrl(root, 'upstream');
+  if (upstream == null || !_isMainRepoUrl(upstream)) {
+    stderr.writeln(
+      'Refusing to apply. upstream must be the main GCRM repo. In the customer folder: git remote rename origin upstream, then git remote add origin <customer-repo-url>.',
+    );
+    exitCode = 1;
+    return;
+  }
+  _detachMainTracking(root);
 
   final displayName = _required(env, 'WL_DISPLAY_NAME');
   final bundleName = _required(env, 'WL_BUNDLE_NAME');
@@ -135,7 +145,8 @@ void main() {
     );
   }
 
-  stdout.writeln('Applied white_label/active.json ($mode).');
+  stdout.writeln('Applied white_label/active.json ($mode) in ${root.path}.');
+  stdout.writeln('The main app was not changed. Push only with: git push -u origin HEAD');
   if (mode == 'white_label' && (androidAppId.isEmpty || iosAppId.isEmpty)) {
     stdout.writeln(
       'Firebase app ids are still empty. Register this application id and bundle id in the existing Firebase project, paste WL_FIREBASE_ANDROID_APP_ID and WL_FIREBASE_IOS_APP_ID, then run this script again.',
@@ -156,16 +167,52 @@ String _optional(Map<String, dynamic> env, String key) {
   return env[key]?.toString().trim() ?? '';
 }
 
-/// True when `origin` is this product repo, not a customer clone.
-bool _originIsMainRepo(Directory root) {
+const _mainRepoSuffix = 'nazarnadeem/gcrmone';
+
+String? _remoteUrl(Directory root, String remote) {
   final result = Process.runSync(
     'git',
-    ['remote', 'get-url', 'origin'],
+    ['remote', 'get-url', remote],
     workingDirectory: root.path,
   );
-  if (result.exitCode != 0) return false;
-  final url = '${result.stdout}'.trim().toLowerCase();
-  return RegExp(r'(^|[/:])gcrmone\.git$').hasMatch(url);
+  if (result.exitCode != 0) return null;
+  final url = '${result.stdout}'.trim();
+  if (url.isEmpty) return null;
+  return url;
+}
+
+bool _isMainRepoUrl(String url) {
+  final normalized = url.trim().toLowerCase().replaceAll(RegExp(r'\.git$'), '');
+  return normalized.endsWith(_mainRepoSuffix);
+}
+
+/// A clone still tracks the main repo after `git remote rename origin upstream`.
+/// A plain `git push` then updates the parent app. Drop that tracking.
+void _detachMainTracking(Directory root) {
+  final tracking = Process.runSync(
+    'git',
+    ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'],
+    workingDirectory: root.path,
+  );
+  if (tracking.exitCode != 0) return;
+  final remote = '${tracking.stdout}'.trim().split('/').first;
+  if (remote.isEmpty) return;
+  final url = _remoteUrl(root, remote);
+  if (url == null || !_isMainRepoUrl(url)) return;
+  final unset = Process.runSync(
+    'git',
+    ['branch', '--unset-upstream'],
+    workingDirectory: root.path,
+  );
+  if (unset.exitCode != 0) {
+    stderr.writeln(
+      'Could not detach this branch from the main GCRM repo. Do not push until that link is gone.',
+    );
+    exit(1);
+  }
+  stdout.writeln(
+    'This branch was tracking the main GCRM repo. A plain git push would update the parent app, so that link is removed.',
+  );
 }
 
 void _write(Directory root, String relativePath, String Function(String source) patch) {

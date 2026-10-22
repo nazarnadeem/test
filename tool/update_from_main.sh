@@ -8,7 +8,7 @@
 #
 # Later, whenever the main app changes:
 #   bash tool/update_from_main.sh
-#   git push
+#   git push origin HEAD
 
 set -euo pipefail
 
@@ -44,6 +44,34 @@ fi
 if ! grep -Eq '"WL_MODE"[[:space:]]*:[[:space:]]*"white_label"' white_label/active.json; then
   echo "WL_MODE in white_label/active.json must be white_label. Run this only in a customer repo."
   exit 1
+fi
+
+is_main_url() {
+  local url="${1%.git}"
+  url="$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]')"
+  [[ "$url" == *nazarnadeem/gcrmone ]]
+}
+
+origin_url="$(git remote get-url origin 2>/dev/null || true)"
+upstream_url="$(git remote get-url "$remote" 2>/dev/null || true)"
+if [[ -z "$origin_url" ]] || is_main_url "$origin_url"; then
+  echo "origin must be the customer repo, not the main GCRM repo. This update was not applied."
+  exit 1
+fi
+if ! is_main_url "$upstream_url"; then
+  echo "The '$remote' remote must be the main GCRM repo. This update was not applied."
+  exit 1
+fi
+
+tracking="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [[ -n "$tracking" ]]; then
+  track_remote="${tracking%%/*}"
+  track_url="$(git remote get-url "$track_remote" 2>/dev/null || true)"
+  if is_main_url "$track_url"; then
+    git branch --unset-upstream
+    echo "This branch was tracking the main GCRM repo. A plain git push would update the parent app, so that link is removed."
+    echo "Push only with: git push origin HEAD"
+  fi
 fi
 
 backup="$(mktemp -d)"
@@ -150,7 +178,7 @@ Commit the files listed by git status, then push:
 
   git add -A
   git commit -m "Apply white-label identity on top of the main app update"
-  git push
+  git push origin HEAD
 
 EOF
 else
