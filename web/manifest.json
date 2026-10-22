@@ -1,11 +1,11 @@
 {
-    "name": "GCRM One",
-    "short_name": "GCRM One",
+    "name": "Test App",
+    "short_name": "Test App",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "The modern multi-vendor operating system for gym chains, independent fitness clubs, trainers, and members.",
+    "description": "Test App",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

@@ -17,7 +17,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.gcrmone"
+        applicationId = "com.testapp"
         minSdk = maxOf(flutter.minSdkVersion, 24)
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
