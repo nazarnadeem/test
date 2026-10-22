@@ -2,6 +2,8 @@
 
 Each customer app is its own GitHub repo. Clone this project, change `white_label/active.json`, then run one command. Leave this repo as the main GCRM app (`WL_MODE` stays `platform`).
 
+Do not edit `white_label/active.json` in this repo, and do not run `dart run tool/apply_white_label.dart` here. That command now stops if this checkout still points at the main repo. Running it here and pushing sends the customer name, package name, and Firebase ids to the main app and to every white-label app that pulls from main. The customer name belongs only in the customer repo. After a fix lands on main, update a customer app with `bash tool/update_from_main.sh`, not a plain pull, so that repo keeps its own name.
+
 Same Firebase project and same rules. The clone can open only the two gyms named in that file: one test gym and one real gym.
 
 ## New customer repo
@@ -30,8 +32,8 @@ git remote add origin <this-white-label-repo-url>
 | `WL_BUNDLE_NAME` | Short iOS name, no spaces |
 | `WL_ANDROID_APPLICATION_ID` | Android package name, such as `com.ironpulse.gym` |
 | `WL_IOS_BUNDLE_ID` | iOS bundle id, same one you added in Firebase |
-| `WL_FIREBASE_ANDROID_APP_ID` | Android app id from Firebase |
-| `WL_FIREBASE_IOS_APP_ID` | iOS app id from Firebase |
+| `WL_FIREBASE_ANDROID_APP_ID` | Android app id from Firebase, like `1:471565987174:android:…`. This is not the package name. |
+| `WL_FIREBASE_IOS_APP_ID` | iOS app id from Firebase, like `1:471565987174:ios:…`. This is not the bundle id. |
 | `WL_SUPPORT_EMAIL` | Support email |
 | `WL_ADMIN_EMAIL` | Admin email |
 | `WL_SUPPORT_PHONE` | Support phone |

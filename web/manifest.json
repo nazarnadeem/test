@@ -1,11 +1,11 @@
 {
-    "name": "Absolute Fit",
-    "short_name": "Absolute Fit",
+    "name": "gcrm_one",
+    "short_name": "gcrm_one",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "Absolute Fit is a platform for managing your fitness center operations. It allows you to manage your members, classes, and bookings.",
+    "description": "A new Flutter project.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

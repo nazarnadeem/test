@@ -23,6 +23,22 @@ void main() {
     return;
   }
   final env = Map<String, dynamic>.from(decoded);
+  final mode = _optional(env, 'WL_MODE');
+  if (mode != 'white_label') {
+    stderr.writeln(
+      'Refusing to apply. WL_MODE is "$mode". This command only runs in a customer clone, where WL_MODE is white_label. Leave this repo as platform.',
+    );
+    exitCode = 1;
+    return;
+  }
+  if (_originIsMainRepo(root)) {
+    stderr.writeln(
+      'Refusing to apply. origin is the main GCRM repo. Clone the project, point origin at the customer repo, edit white_label/active.json there, then run this command. Running it here and pushing writes the customer name onto the main app and every clone that pulls main.',
+    );
+    exitCode = 1;
+    return;
+  }
+
   final displayName = _required(env, 'WL_DISPLAY_NAME');
   final bundleName = _required(env, 'WL_BUNDLE_NAME');
   final description = _required(env, 'WL_APP_DESCRIPTION');
@@ -30,7 +46,6 @@ void main() {
   final iosBundleId = _required(env, 'WL_IOS_BUNDLE_ID');
   final androidAppId = _optional(env, 'WL_FIREBASE_ANDROID_APP_ID');
   final iosAppId = _optional(env, 'WL_FIREBASE_IOS_APP_ID');
-  final mode = _optional(env, 'WL_MODE');
 
   _write(
     root,
@@ -139,6 +154,18 @@ String _required(Map<String, dynamic> env, String key) {
 
 String _optional(Map<String, dynamic> env, String key) {
   return env[key]?.toString().trim() ?? '';
+}
+
+/// True when `origin` is this product repo, not a customer clone.
+bool _originIsMainRepo(Directory root) {
+  final result = Process.runSync(
+    'git',
+    ['remote', 'get-url', 'origin'],
+    workingDirectory: root.path,
+  );
+  if (result.exitCode != 0) return false;
+  final url = '${result.stdout}'.trim().toLowerCase();
+  return RegExp(r'(^|[/:])gcrmone\.git$').hasMatch(url);
 }
 
 void _write(Directory root, String relativePath, String Function(String source) patch) {

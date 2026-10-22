@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.gcrmone_new"
+    namespace = "com.gcrmone"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -17,7 +17,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.absolutefit"
+        applicationId = "com.gcrmone"
         minSdk = maxOf(flutter.minSdkVersion, 24)
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
