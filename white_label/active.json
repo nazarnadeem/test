@@ -1,7 +1,7 @@
 {
-  "WL_MODE": "platform",
-  "WL_TEST_TENANT_ID": "",
-  "WL_LIVE_TENANT_ID": "",
+  "WL_MODE": "white_label",
+  "WL_TEST_TENANT_ID": "tttt",
+  "WL_LIVE_TENANT_ID": "gggggg",
   "WL_APP_NAME": "GCRM ONE",
   "WL_APP_NAME_PREFIX": "GCRM ",
   "WL_APP_NAME_SUFFIX": "ONE",

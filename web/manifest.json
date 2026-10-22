@@ -1,11 +1,11 @@
 {
-    "name": "gcrm_one",
-    "short_name": "gcrm_one",
+    "name": "GCRM One",
+    "short_name": "GCRM One",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "The modern multi-vendor operating system for gym chains, independent fitness clubs, trainers, and members.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
