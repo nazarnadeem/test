@@ -1,0 +1,47 @@
+name: gcrm_one
+description: "GCRM One - All Your Gym Operations, Unified. Multi-vendor Gym Management System."
+publish_to: 'none'
+#Test changes
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_bloc: ^8.1.6
+  equatable: ^2.0.5
+  google_fonts: ^6.1.0
+  intl: ^0.19.0
+  cupertino_icons: ^1.0.6
+  firebase_core: ^4.13.0
+  firebase_auth: ^6.5.7
+  cloud_firestore: ^6.8.0
+  image_picker: ^1.2.3
+  firebase_storage: ^13.4.6
+  image: ^4.9.2
+  firebase_messaging: ^16.7.0
+  pdf: ^3.13.1
+  printing: ^5.15.1
+  mobile_scanner: ^7.4.2
+  crypto: ^3.0.7
+  cached_network_image: ^3.4.1
+  flutter_local_notifications: ^22.3.1
+  web: ^1.1.1
+  video_compress: ^3.1.4
+  video_player: ^2.14.1
+  cloud_functions: ^6.5.0
+  url_launcher: ^6.3.1
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  bloc_test: ^9.1.7
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+    - white_label/active.json

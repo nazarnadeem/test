@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "471565987174",
+    "project_id": "gcrm-one",
+    "storage_bucket": "gcrm-one.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:471565987174:android:5b8172b602bfa4f7c8eca7",
+        "android_client_info": {
+          "package_name": "com.gcrmone"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDsvAxMuRvdWs82Y6aDbTjcCPjnxul4gus"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,214 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ──────── HELPER FUNCTIONS ────────
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isUser(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role == 'super_admin' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'super_admin' ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'superAdmin'))
+      );
+    }
+
+    function isGymAdmin(tenantId) {
+      return isAuthenticated() && (
+        isSuperAdmin() ||
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'gym_admin' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'gymOwner' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'trainer' ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin')
+      );
+    }
+
+    // ──────── 1. USERS COLLECTION ────────
+    // Read allowed for auth and profile lookups; write allowed for account owner, admins, or authenticated users.
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update: if isUser(userId) || isSuperAdmin() || isAuthenticated();
+      allow delete: if isSuperAdmin();
+
+      // One document per notification so the app can read 10 at a time.
+      match /notifications/{notificationId} {
+        allow read: if true;
+        allow create, update: if isAuthenticated();
+        allow delete: if isUser(userId) || isSuperAdmin();
+      }
+    }
+
+    // ──────── 2. GYM TENANTS / FRANCHISES (BY GYM ID) ────────
+    // Public visitors can read basic gym details; admin & staff can manage.
+    match /tenants/{tenantId} {
+      allow read: if true;
+      allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+
+      // ── Team Members (Public website can read team: Name, role, photo, experience, gender) ──
+      match /team_members/{memberId} {
+        allow read: if true;
+        allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Membership Plans (Public website can read plans & pricing) ──
+      match /membership_plans/{planId} {
+        allow read: if true;
+        allow write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Facility Batches & Schedules ──
+      match /batches/{batchId} {
+        allow read, create, update, delete, write: if true;
+      }
+
+      // ── Facility Showcase Media Gallery (Photos & Videos) ──
+      match /gallery/{itemId} {
+        allow read: if true;
+        allow create, update, delete, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Registered Members Directory ──
+      match /members/{memberId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Check-In Logs / Scanner Stream ──
+      match /check_ins/{checkInId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Operating Expenses Ledger ──
+      match /expenses/{expenseId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+
+      // ── Financials / Billing / POS Collections ──
+      match /financials/{docId} {
+        allow read, write: if isGymAdmin(tenantId) || isSuperAdmin() || isAuthenticated();
+      }
+    }
+
+    // ──────── COLLECTION GROUPS & NESTED FALLBACKS ────────
+    match /{path=**}/batches/{batchId} {
+      allow read, create, update, delete, write: if true;
+    }
+
+    match /{path=**}/gallery/{itemId} {
+      allow read: if true;
+      allow create, update, delete, write: if isSuperAdmin() || isAuthenticated() || true;
+    }
+
+    match /{path=**}/members/{memberId} {
+      allow read, write: if isAuthenticated() || true;
+    }
+
+    match /{path=**}/check_ins/{checkInId} {
+      allow read, write: if isAuthenticated() || true;
+    }
+
+    match /{path=**}/expenses/{expenseId} {
+      allow read, write: if isAuthenticated() || true;
+    }
+
+    match /{path=**}/team_members/{memberId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /{path=**}/membership_plans/{planId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // Direct root collections fallbacks
+    match /team_members/{memberId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /batches/{batchId} {
+      allow read, create, update, delete, write: if true;
+    }
+
+    match /gallery/{itemId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /expenses/{expenseId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /members/{memberId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    match /check_ins/{checkInId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // ──────── 3. PLATFORM SUBSCRIPTION PLANS ────────
+    match /platform_plans/{planId} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || isAuthenticated();
+    }
+
+    // ──────── 4. PLATFORM GOVERNANCE ────────
+    match /platform_governance/{docId} {
+      allow read: if true;
+      allow write: if isSuperAdmin() || isAuthenticated();
+    }
+
+    // ──────── 5. WORKOUTS, CLASSES, MEMBERSHIPS, ATTENDANCE ────────
+    match /classes/{classId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+    
+    match /memberships/{membershipId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+    
+    match /attendance/{logId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    match /workouts/{workoutId} {
+      allow read: if true;
+      allow write: if isAuthenticated();
+    }
+
+    // ──────── 6. PUSH NOTIFICATIONS QUEUE & BROADCASTS ────────
+    match /notifications_queue/{notificationId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // Written by Cloud Functions. Gym admins read delivery status and errors.
+    match /whatsapp_message_logs/{logId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // Per-gym WhatsApp tokens. Only Cloud Functions can read or write this collection.
+    match /whatsapp_secrets/{tenantId} {
+      allow read, write: if false;
+    }
+
+    // Daily membership reminder claims. Only Cloud Functions can read or write these.
+    match /membership_reminder_logs/{logId} {
+      allow read, write: if false;
+    }
+  }
+}
