@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.gcrmone"
+    namespace = "com.gcrmone_new"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
