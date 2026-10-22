@@ -7,9 +7,9 @@
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:471565987174:android:5b8172b602bfa4f7c8eca7",
+        "mobilesdk_app_id": "com.absolutefit",
         "android_client_info": {
-          "package_name": "com.gcrmone"
+          "package_name": "com.absolutefit"
         }
       },
       "oauth_client": [],
